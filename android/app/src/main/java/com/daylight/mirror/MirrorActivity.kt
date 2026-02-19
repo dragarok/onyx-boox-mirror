@@ -6,11 +6,11 @@ package com.daylight.mirror
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.app.Activity
+import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
 import android.view.Gravity
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -21,6 +21,7 @@ import android.view.animation.AccelerateDecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.io.File
 
 class MirrorActivity : Activity() {
 
@@ -172,27 +173,37 @@ class MirrorActivity : Activity() {
     }
 
     /// Called from native code when a brightness command arrives.
+    /// Writes directly to Boox sysfs frontlight driver (range 0-25).
     @Suppress("unused")
     fun setBrightness(value: Int) {
-        val clamped = value.coerceIn(0, 255)
-        runOnUiThread {
-            val lp = window.attributes
-            lp.screenBrightness = clamped / 255f
-            window.attributes = lp
-        }
+        val scaled = (value.coerceIn(0, 255) * 25) / 255
+        Thread {
+            try {
+                File("/sys/class/backlight/onyx_bl_br/brightness").writeText(scaled.toString())
+            } catch (e: Exception) {
+                android.util.Log.e("DaylightMirror", "Cannot set brightness: ${e.message}")
+            }
+        }.start()
     }
 
     /// Called from native code when a warmth command arrives.
+    /// Writes directly to Boox sysfs color temperature driver (range 0-24).
     @Suppress("unused")
     fun setWarmth(value: Int) {
-        val amberRate = (value.coerceIn(0, 255) * 1023) / 255
-        runOnUiThread {
+        val scaled = (value.coerceIn(0, 255) * 24) / 255
+        Thread {
             try {
-                Settings.System.putInt(contentResolver, "screen_brightness_amber_rate", amberRate)
+                File("/sys/class/backlight/onyx_bl_ct/brightness").writeText(scaled.toString())
             } catch (e: Exception) {
-                android.util.Log.e("DaylightMirror", "Cannot set amber_rate: ${e.message}")
+                android.util.Log.e("DaylightMirror", "Cannot set warmth: ${e.message}")
             }
-        }
+        }.start()
+    }
+
+    /// Called from native code to trigger a full e-ink screen refresh.
+    @Suppress("unused")
+    fun refreshScreen() {
+        sendBroadcast(Intent("android.onyx.action.FULL_REFRESH"))
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

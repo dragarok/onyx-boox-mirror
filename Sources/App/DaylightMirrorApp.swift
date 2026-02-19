@@ -163,7 +163,7 @@ struct SetupView: View {
             }
 
             VStack(alignment: .leading, spacing: 12) {
-                featureRow("bolt.fill", "24 FPS, LZ4 delta compression")
+                featureRow("bolt.fill", "60 FPS, LZ4 delta compression")
                 featureRow("eye", "Greyscale default (3x faster), color toggle available")
                 featureRow("keyboard", "Shortcuts for brightness and more")
             }
@@ -450,12 +450,14 @@ struct MirrorMenuView: View {
                     .font(.system(size: 9))
                     .foregroundStyle(.tertiary)
                 if engine.status == .running {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 4) {
                         shortcutPill("F8", label: "Mirror")
                         Spacer()
-                        shortcutGroup("F1", "F2", label: "Brightness")
+                        shortcutGroup("F1", "F2", label: "Bright")
                         Spacer()
-                        shortcutPill("F10", label: "Backlight")
+                        shortcutGroup("F3", "F4", label: "Warm")
+                        Spacer()
+                        shortcutPill("F5", label: "Refresh")
                     }
                 } else {
                     HStack {
@@ -555,7 +557,7 @@ struct MirrorMenuView: View {
                 statsRow("Total frames", "\(engine.totalFrames)")
                 statsRow("RGB convert", String(format: "%.1f ms", engine.greyMs))
                 statsRow("LZ4 compress", String(format: "%.1f ms", engine.compressMs))
-                statsRow("Frame budget", String(format: "%.0f%%", (engine.greyMs + engine.compressMs) / (1000.0 / 24.0) * 100))
+                statsRow("Frame budget", String(format: "%.0f%%", (engine.greyMs + engine.compressMs) / (1000.0 / 60.0) * 100))
             }
             .padding(.horizontal, 4)
             .padding(.vertical, 4)
@@ -605,7 +607,7 @@ struct MirrorMenuView: View {
 
         Divider()
 
-        // Brightness slider (quadratic curve with widened low-end zone)
+        // Brightness slider
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Image(systemName: "sun.min")
@@ -627,16 +629,45 @@ struct MirrorMenuView: View {
             }
         }
 
-        // Backlight toggle
-        Toggle(isOn: Binding(
-            get: { engine.backlightOn },
-            set: { _ in engine.toggleBacklight() }
-        )) {
-            Label("Backlight", systemImage: "lightbulb")
-                .font(.caption)
+        // Warmth slider
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Image(systemName: "thermometer.snowflake")
+                    .font(.caption2)
+                Slider(
+                    value: Binding(
+                        get: { Double(engine.warmth) / 255.0 },
+                        set: { engine.setWarmth(Int($0 * 255.0)) }
+                    ),
+                    in: 0...1
+                )
+                Image(systemName: "thermometer.sun")
+                    .font(.caption2)
+            }
         }
-        .toggleStyle(.switch)
-        .controlSize(.small)
+
+        HStack {
+            // Backlight toggle
+            Toggle(isOn: Binding(
+                get: { engine.backlightOn },
+                set: { _ in engine.toggleBacklight() }
+            )) {
+                Label("Backlight", systemImage: "lightbulb")
+                    .font(.caption)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+
+            Spacer()
+
+            // Full refresh button
+            Button(action: { engine.refreshScreen() }) {
+                Label("Refresh", systemImage: "arrow.clockwise")
+                    .font(.caption)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
 
         Divider()
 

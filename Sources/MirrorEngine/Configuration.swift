@@ -64,9 +64,11 @@ let MAGIC_CMD: [UInt8] = [0xDA, 0x7F]
 let MAGIC_ACK: [UInt8] = [0xDA, 0x7A]  // ACK from Android → Mac for RTT measurement
 let FLAG_KEYFRAME: UInt8 = 0x01
 let CMD_BRIGHTNESS: UInt8 = 0x01
+let CMD_WARMTH: UInt8 = 0x02
 let CMD_BACKLIGHT_TOGGLE: UInt8 = 0x03
 let CMD_RESOLUTION: UInt8 = 0x04
 let CMD_COLOR_MODE: UInt8 = 0x05
+let CMD_REFRESH: UInt8 = 0x06
 
 let FLAG_TILED: UInt8 = 0x02
 let TILE_SIZE: Int = 64
@@ -76,6 +78,7 @@ let TILE_SIZE: Int = 64
 let FRAME_HEADER_SIZE = 11
 
 let BRIGHTNESS_STEP: Int = 15
+let WARMTH_STEP: Int = 15
 
 // MARK: - Status
 

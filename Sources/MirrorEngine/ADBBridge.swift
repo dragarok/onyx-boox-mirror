@@ -231,6 +231,39 @@ struct ADBBridge {
         try? process.run()
     }
 
+    /// Run a raw shell command via `adb shell` using /bin/sh to handle redirects.
+    private static func runShellCommand(_ cmd: String) {
+        guard let adbPath = resolvedADBPath else {
+            NSLog("[ADB] runShellCommand: no adb binary")
+            return
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", "\(adbPath) shell '\(cmd)'"]
+        process.environment = shellEnvironment
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus != 0 {
+                NSLog("[ADB] shell command failed (exit %d): %@", process.terminationStatus, cmd)
+            }
+        } catch {
+            NSLog("[ADB] runShellCommand error: %@", "\(error)")
+        }
+    }
+
+    /// Write a value to a sysfs file on the device via adb shell.
+    static func writeSysfs(_ path: String, value: Int) {
+        runShellCommand("echo \(value) > \(path)")
+    }
+
+    /// Trigger a full e-ink refresh via Onyx broadcast.
+    static func triggerEinkRefresh() {
+        runShellCommand("am broadcast -a android.onyx.action.FULL_REFRESH")
+    }
+
     /// Check if the companion Android app is installed on the connected device.
     static func isAppInstalled() -> Bool {
         let pipe = Pipe()

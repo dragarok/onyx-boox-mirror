@@ -56,6 +56,8 @@ class ScreenCapture: NSObject {
     // CGDisplayStream runtime handles
     private var cgHandle: UnsafeMutableRawPointer?       // dlopen handle
     private var displayStream: OpaquePointer?            // retained stream ref
+    private var captureQueue: DispatchQueue?             // saved for drain on stop
+    private var isStopping = false                       // prevents buffer swap after stop
 
     var useColor: Bool = false
     var bytesPerPixel: Int { useColor ? 3 : 1 }
@@ -77,6 +79,7 @@ class ScreenCapture: NSObject {
     var convertTimeSum: Double = 0
     var compressTimeSum: Double = 0
     var statFrames: Int = 0
+    var sentStatFrames: Int = 0  // only frames actually broadcast to Android
     var lastCompressedSize: Int = 0
 
     // VFR idle detection — tile detection handles this (0 dirty tiles = skip frame)
@@ -152,7 +155,9 @@ class ScreenCapture: NSObject {
             "kCGDisplayStreamShowCursor": kCFBooleanTrue as Any
         ]
 
-        let captureQueue = DispatchQueue(label: "capture", qos: .userInteractive)
+        let queue = DispatchQueue(label: "capture", qos: .userInteractive)
+        self.captureQueue = queue
+        isStopping = false
         let pixelFormat: Int32 = 1111970369  // kCVPixelFormatType_32BGRA (0x42475241)
 
         // Create the display stream
@@ -162,7 +167,7 @@ class ScreenCapture: NSObject {
             frameHeight,
             pixelFormat,
             properties as CFDictionary,
-            captureQueue,
+            queue,
             { [weak self] (status: Int32, _: UInt64, surface: IOSurfaceRef?, _: OpaquePointer?) in
                 self?.handleFrame(status: status, surface: surface)
             }
@@ -190,34 +195,25 @@ class ScreenCapture: NSObject {
         print("Capture started at \(TARGET_FPS)fps -- CGDisplayStream + \(modeName) + LZ4 delta (zero GPU)")
     }
 
-    /// Switch between greyscale and color mode. Reallocates buffers and forces a keyframe.
-    func setColorMode(_ color: Bool) {
-        useColor = color
-        let newSize = pixelCount * bytesPerPixel
-        bufferSize = newSize
-
-        currentRGB?.deallocate()
-        previousRGB?.deallocate()
-        deltaBuffer?.deallocate()
-        compressedBuffer?.deallocate()
-
-        currentRGB = .allocate(capacity: bufferSize)
-        previousRGB = .allocate(capacity: bufferSize)
-        deltaBuffer = .allocate(capacity: bufferSize)
-        let maxCompressed = LZ4_compressBound(Int32(bufferSize))
-        compressedBuffer = .allocate(capacity: Int(maxCompressed))
-        previousRGB!.initialize(repeating: 0, count: bufferSize)
-        forceNextKeyframe = true
-        consecutiveIdleFrames = 0
-        print("[Capture] Switched to \(color ? "color" : "greyscale") mode (\(bytesPerPixel) bytes/pixel)")
-    }
+    // Color mode is set at init time. To switch, MirrorEngine does a full restart.
 
     func stop() async {
+        // Signal handleFrame to bail out before touching buffers
+        isStopping = true
+
         if let stream = displayStream {
             // Load stop function
             if let cg = cgHandle, let stopSym = dlsym(cg, "CGDisplayStreamStop") {
                 let stopFn = unsafeBitCast(stopSym, to: CGDisplayStreamStopFn.self)
                 _ = stopFn(stream)
+            }
+            // Drain the capture queue — ensures any in-flight callback has finished
+            // before we deallocate buffers. Without this, handleFrame can write freed
+            // pointers back into ivars → double-free on next dealloc.
+            if let q = captureQueue {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    q.async { cont.resume() }
+                }
             }
             // Release the retained CFTypeRef
             let cfStream = Unmanaged<CFTypeRef>.fromOpaque(UnsafeRawPointer(stream))
@@ -228,10 +224,12 @@ class ScreenCapture: NSObject {
             dlclose(cg)
             cgHandle = nil
         }
+        // Safe to deallocate — no callbacks can be running
         currentRGB?.deallocate(); currentRGB = nil
         previousRGB?.deallocate(); previousRGB = nil
         deltaBuffer?.deallocate(); deltaBuffer = nil
         compressedBuffer?.deallocate(); compressedBuffer = nil
+        captureQueue = nil
     }
 
     // MARK: - Frame callback
@@ -239,14 +237,12 @@ class ScreenCapture: NSObject {
     private func handleFrame(status: Int32, surface: IOSurfaceRef?) {
         // Status codes:
         // 0 = FrameComplete, 1 = FrameIdle, 2 = FrameBlank, 3 = Stopped
-        guard status == 0, let surface = surface else { return }
+        guard status == 0, let surface = surface, !isStopping else { return }
 
         // Guard against race: stop() deallocates buffers while callback is in-flight.
         // Capture local copies so stop() can't nil them out mid-frame.
         guard let curBuf = currentRGB, let prevBuf = previousRGB,
               let deltaBuf = deltaBuffer, let compBuf = compressedBuffer else { return }
-        // Local copies protect against stop() nilling ivars mid-frame.
-        // From here on, use curBuf/prevBuf/deltaBuf/compBuf — never force-unwrap the ivars.
 
         let t0 = CACurrentMediaTime()
 
@@ -297,10 +293,11 @@ class ScreenCapture: NSObject {
         if inflight > adaptiveThreshold && !isScheduledKeyframe {
             skippedFrames += 1
             forceNextKeyframe = true
-            // Still swap buffers so curBuf stays fresh for next delta base
-            previousRGB = curBuf
-            currentRGB = prevBuf
-
+            // Swap buffers so curBuf stays fresh for next delta base
+            if !isStopping {
+                previousRGB = curBuf
+                currentRGB = prevBuf
+            }
             IOSurfaceUnlock(surface, .readOnly, nil)
             frameCount += 1
             return
@@ -319,6 +316,7 @@ class ScreenCapture: NSObject {
             )
             let payload = Data(bytes: compBuf, count: Int(compressedSize))
             tcpServer.broadcast(payload: payload, isKeyframe: true, sequenceNumber: seq)
+            sentStatFrames += 1
             lastCompressedSize = Int(compressedSize)
         } else {
             // Tile-based dirty detection: compare tiles, send only changed ones
@@ -385,6 +383,7 @@ class ScreenCapture: NSObject {
                 } else {
                     let payload = Data(bytes: compBuf, count: Int(compressedSize))
                     tcpServer.broadcast(payload: payload, isKeyframe: false, sequenceNumber: seq)
+                    sentStatFrames += 1
                 }
                 lastCompressedSize = Int(compressedSize)
             } else {
@@ -446,10 +445,17 @@ class ScreenCapture: NSObject {
 
                 tcpServer.broadcast(payload: tiledPayload, isKeyframe: false,
                                     sequenceNumber: seq, flags: FLAG_TILED)
+                sentStatFrames += 1
                 lastCompressedSize = tiledPayload.count
             }
         }
 
+        // Swap buffers — but only if stop() hasn't started tearing down.
+        // Writing freed pointers back would cause a double-free.
+        guard !isStopping else {
+            IOSurfaceUnlock(surface, .readOnly, nil)
+            return
+        }
         previousRGB = curBuf
         currentRGB = prevBuf
 
@@ -475,18 +481,21 @@ class ScreenCapture: NSObject {
 
         let now = Date()
         if now.timeIntervalSince(lastStatTime) >= 5.0 {
-            let fps = Double(statFrames) / now.timeIntervalSince(lastStatTime)
+            let elapsed = now.timeIntervalSince(lastStatTime)
+            // FPS = frames actually sent to Android (not idle callbacks)
+            let sentFps = Double(sentStatFrames) / elapsed
             let avgConvert = statFrames > 0 ? convertTimeSum / Double(statFrames) : 0
             let avgCompress = statFrames > 0 ? compressTimeSum / Double(statFrames) : 0
-            let bw = Double(lastCompressedSize) * fps / 1024 / 1024
+            let bw = Double(lastCompressedSize) * sentFps / 1024 / 1024
             let avgJitter = jitterSamples.isEmpty ? 0.0 : jitterSamples.reduce(0, +) / Double(jitterSamples.count)
 
             let modeLabel = useColor ? "rgb" : "grey"
             print(String(format: "FPS: %.1f | %@: %.1fms | lz4+delta: %.1fms | jitter: %.1fms | frame: %dKB | ~%.1fMB/s | total: %d | skipped: %d",
-                         fps, modeLabel, avgConvert, avgCompress, avgJitter, lastCompressedSize / 1024, bw, frameCount, skippedFrames))
-            onStats?(fps, bw, lastCompressedSize / 1024, frameCount, avgConvert, avgCompress, avgJitter, skippedFrames)
+                         sentFps, modeLabel, avgConvert, avgCompress, avgJitter, lastCompressedSize / 1024, bw, frameCount, skippedFrames))
+            onStats?(sentFps, bw, lastCompressedSize / 1024, frameCount, avgConvert, avgCompress, avgJitter, skippedFrames)
 
             statFrames = 0
+            sentStatFrames = 0
             convertTimeSum = 0
             compressTimeSum = 0
             lastStatTime = now

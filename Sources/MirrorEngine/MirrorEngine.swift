@@ -24,6 +24,7 @@ public class MirrorEngine: ObservableObject {
     @Published public var fps: Double = 0
     @Published public var bandwidth: Double = 0
     @Published public var brightness: Int = 128
+    @Published public var warmth: Int = 0
     @Published public var backlightOn: Bool = true
     @Published public var adbConnected: Bool = false
     @Published public var apkInstallStatus: String = ""  // Empty = idle, "Installing..." = in progress, "Installed" = done, or error
@@ -354,6 +355,9 @@ public class MirrorEngine: ObservableObject {
         dc.onBrightnessChanged = { [weak self] val in
             DispatchQueue.main.async { self?.brightness = val }
         }
+        dc.onWarmthChanged = { [weak self] val in
+            DispatchQueue.main.async { self?.warmth = val }
+        }
         dc.onBacklightChanged = { [weak self] on in
             DispatchQueue.main.async { self?.backlightOn = on }
         }
@@ -362,6 +366,7 @@ public class MirrorEngine: ObservableObject {
 
         // Sync initial values
         brightness = dc.currentBrightness
+        warmth = dc.currentWarmth
         backlightOn = dc.backlightOn
 
         status = .running
@@ -516,6 +521,11 @@ public class MirrorEngine: ObservableObject {
         backlightOn = brightness > 0
     }
 
+    public func setWarmth(_ value: Int) {
+        displayController?.setWarmth(value)
+        warmth = max(0, min(255, value))
+    }
+
     public func toggleBacklight() {
         displayController?.toggleBacklight()
         if let dc = displayController {
@@ -524,13 +534,22 @@ public class MirrorEngine: ObservableObject {
         }
     }
 
+    public func refreshScreen() {
+        displayController?.refreshScreen()
+    }
+
     /// Switch between greyscale (default, fast) and color mode.
+    /// Requires a full restart to avoid buffer races.
     public func setColorMode(_ enabled: Bool) {
         useColor = enabled
-        capture?.setColorMode(enabled)
-        tcpServer?.isColorMode = enabled
-        tcpServer?.sendColorMode()
         print("[Engine] Color mode: \(enabled ? "on" : "off")")
+        if status == .running {
+            stop()
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(0.5))
+                await start()
+            }
+        }
     }
 
     /// Disable macOS font smoothing (subpixel AA). Improves text clarity

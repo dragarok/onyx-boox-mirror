@@ -47,8 +47,10 @@
 #define FLAG_KEYFRAME 0x01
 #define FRAME_HEADER_SIZE 11
 #define CMD_BRIGHTNESS 0x01
+#define CMD_WARMTH     0x02
 #define CMD_RESOLUTION 0x04
 #define CMD_COLOR_MODE 0x05
+#define CMD_REFRESH    0x06
 #define FLAG_TILED     0x02
 
 // Global state
@@ -831,6 +833,23 @@ static void *decode_thread(void *arg) {
                     continue;
                 }
 
+                if (cmd == CMD_REFRESH) {
+                    // Refresh has no value byte — trigger full e-ink refresh
+                    if (g_jvm && g_activity) {
+                        JNIEnv *env;
+                        int attached = 0;
+                        if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+                            (*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL);
+                            attached = 1;
+                        }
+                        jclass cls = (*env)->GetObjectClass(env, g_activity);
+                        jmethodID mid = (*env)->GetMethodID(env, cls, "refreshScreen", "()V");
+                        if (mid) (*env)->CallVoidMethod(env, g_activity, mid);
+                        if (attached) (*g_jvm)->DetachCurrentThread(g_jvm);
+                    }
+                    continue;
+                }
+
                 uint8_t value;
                 if (read_exact(sock, &value, 1) < 0) break;
                 if (g_jvm && g_activity) {
@@ -844,7 +863,7 @@ static void *decode_thread(void *arg) {
                     if (cmd == CMD_BRIGHTNESS) {
                         jmethodID mid = (*env)->GetMethodID(env, cls, "setBrightness", "(I)V");
                         if (mid) (*env)->CallVoidMethod(env, g_activity, mid, (jint)value);
-                    } else if (cmd == 0x02) {
+                    } else if (cmd == CMD_WARMTH) {
                         jmethodID mid = (*env)->GetMethodID(env, cls, "setWarmth", "(I)V");
                         if (mid) (*env)->CallVoidMethod(env, g_activity, mid, (jint)value);
                     }

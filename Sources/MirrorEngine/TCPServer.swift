@@ -280,4 +280,18 @@ class TCPServer {
         }
         print("[TCP] Sent color mode: \(isColorMode ? "color" : "greyscale")")
     }
+
+    /// Send refresh command (no value byte): [DA 7F] [06]
+    func sendRefresh() {
+        var packet = Data(capacity: 3)
+        packet.append(contentsOf: MAGIC_CMD)
+        packet.append(CMD_REFRESH)
+
+        lock.lock()
+        let conns = connections
+        lock.unlock()
+        for conn in conns {
+            conn.send(content: packet, completion: .contentProcessed { _ in })
+        }
+    }
 }
