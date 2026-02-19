@@ -54,11 +54,6 @@ class VirtualDisplayManager {
     }
 
     func mirrorBuiltInDisplay() {
-        guard mirror else {
-            print("Secondary display mode — skipping mirror setup (arrange in System Settings > Displays)")
-            return
-        }
-
         var displayIDs = [CGDirectDisplayID](repeating: 0, count: 32)
         var displayCount: UInt32 = 0
         CGGetOnlineDisplayList(32, &displayIDs, &displayCount)
@@ -82,17 +77,32 @@ class VirtualDisplayManager {
             return
         }
 
-        guard CGConfigureDisplayMirrorOfDisplay(config, masterID, displayID) == .success else {
-            print("WARNING: Failed to configure mirror")
-            CGCancelDisplayConfiguration(config)
-            return
+        if mirror {
+            // Mirror: make the built-in display mirror our virtual display
+            guard CGConfigureDisplayMirrorOfDisplay(config, masterID, displayID) == .success else {
+                print("WARNING: Failed to configure mirror")
+                CGCancelDisplayConfiguration(config)
+                return
+            }
+        } else {
+            // Secondary: explicitly break any mirroring on our virtual display
+            // kCGNullDirectDisplay (0) as master = stop mirroring
+            guard CGConfigureDisplayMirrorOfDisplay(config, displayID, CGMainDisplayID() == displayID ? 0 : 0) == .success else {
+                print("WARNING: Failed to break mirror")
+                CGCancelDisplayConfiguration(config)
+                return
+            }
         }
 
         guard CGCompleteDisplayConfiguration(config, .forSession) == .success else {
-            print("WARNING: Failed to complete mirror configuration")
+            print("WARNING: Failed to complete display configuration")
             return
         }
 
-        print("Mirroring: built-in display \(masterID) -> virtual display \(displayID)")
+        if mirror {
+            print("Mirroring: built-in display \(masterID) -> virtual display \(displayID)")
+        } else {
+            print("Secondary display: \(displayID) (independent of built-in \(masterID))")
+        }
     }
 }

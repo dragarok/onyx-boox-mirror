@@ -651,6 +651,24 @@ struct MirrorMenuView: View {
         .toggleStyle(.switch)
         .controlSize(.small)
 
+        // Mirror / Secondary display toggle (requires restart)
+        Toggle(isOn: Binding(
+            get: { engine.mirrorMode },
+            set: { newVal in
+                engine.mirrorMode = newVal
+                engine.stop()
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(0.5))
+                    await engine.start()
+                }
+            }
+        )) {
+            Label(engine.mirrorMode ? "Mirror mode" : "Secondary display", systemImage: engine.mirrorMode ? "rectangle.on.rectangle" : "display.2")
+                .font(.caption)
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+
         // Auto-reconnect toggle
         Toggle(isOn: $engine.autoMirrorEnabled) {
             Label("Auto-reconnect on USB", systemImage: "cable.connector")
@@ -766,6 +784,14 @@ struct MirrorMenuView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             Divider()
+
+            // Mirror / Secondary display toggle
+            Toggle(isOn: $engine.mirrorMode) {
+                Label(engine.mirrorMode ? "Mirror mode" : "Secondary display", systemImage: engine.mirrorMode ? "rectangle.on.rectangle" : "display.2")
+                    .font(.caption)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
 
             // Resolution picker
             Picker("Resolution", selection: $engine.resolution) {

@@ -241,9 +241,12 @@ class ScreenCapture: NSObject {
         // 0 = FrameComplete, 1 = FrameIdle, 2 = FrameBlank, 3 = Stopped
         guard status == 0, let surface = surface else { return }
 
-        // Guard against race: stop() deallocates buffers while callback is in-flight
-        guard currentRGB != nil, previousRGB != nil,
-              deltaBuffer != nil, compressedBuffer != nil else { return }
+        // Guard against race: stop() deallocates buffers while callback is in-flight.
+        // Capture local copies so stop() can't nil them out mid-frame.
+        guard let curBuf = currentRGB, let prevBuf = previousRGB,
+              let deltaBuf = deltaBuffer, let compBuf = compressedBuffer else { return }
+        // Local copies protect against stop() nilling ivars mid-frame.
+        // From here on, use curBuf/prevBuf/deltaBuf/compBuf — never force-unwrap the ivars.
 
         let t0 = CACurrentMediaTime()
 
@@ -269,21 +272,18 @@ class ScreenCapture: NSObject {
 
         if useColor {
             // Color: BGRA → RGB via vImageConvert_BGRA8888toRGB888
-            var dstBuf = vImage_Buffer(data: currentRGB!, height: vImagePixelCount(frameHeight),
+            var dstBuf = vImage_Buffer(data: curBuf, height: vImagePixelCount(frameHeight),
                                        width: vImagePixelCount(frameWidth), rowBytes: frameWidth * 3)
             vImageConvert_BGRA8888toRGB888(&srcBuf, &dstBuf, vImage_Flags(kvImageNoFlags))
         } else {
             // Greyscale: BGRA → Planar8 via matrix multiply (BT.601 luma)
             // BGRA channel order: weights are [B, G, R, A]
-            var dstBuf = vImage_Buffer(data: currentRGB!, height: vImagePixelCount(frameHeight),
+            var dstBuf = vImage_Buffer(data: curBuf, height: vImagePixelCount(frameHeight),
                                        width: vImagePixelCount(frameWidth), rowBytes: frameWidth)
-            let matrix: [Int16] = [114, 587, 299, 0]  // BT.601: B=114, G=587, R=299
-            matrix.withUnsafeBufferPointer { matPtr in
-                var preBias: Int16 = 0
-                vImageMatrixMultiply_ARGB8888ToPlanar8(
-                    &srcBuf, &dstBuf, matPtr.baseAddress!, 1000,
-                    &preBias, 0, vImage_Flags(kvImageNoFlags))
-            }
+            var matrix: [Int16] = [114, 587, 299, 0]  // BT.601: B=114, G=587, R=299
+            vImageMatrixMultiply_ARGB8888ToPlanar8(
+                &srcBuf, &dstBuf, &matrix, 1000,
+                nil, 0, vImage_Flags(kvImageNoFlags))
         }
 
         let t1 = CACurrentMediaTime()
@@ -297,10 +297,9 @@ class ScreenCapture: NSObject {
         if inflight > adaptiveThreshold && !isScheduledKeyframe {
             skippedFrames += 1
             forceNextKeyframe = true
-            // Still swap buffers so currentRGB stays fresh for next delta base
-            let temp = previousRGB
-            previousRGB = currentRGB
-            currentRGB = temp
+            // Still swap buffers so curBuf stays fresh for next delta base
+            previousRGB = curBuf
+            currentRGB = prevBuf
 
             IOSurfaceUnlock(surface, .readOnly, nil)
             frameCount += 1
@@ -315,10 +314,10 @@ class ScreenCapture: NSObject {
         if isKeyframe {
             consecutiveIdleFrames = 0
             let compressedSize = LZ4_compress_default(
-                currentRGB!, compressedBuffer!, Int32(bufferSize),
+                curBuf, compBuf, Int32(bufferSize),
                 LZ4_compressBound(Int32(bufferSize))
             )
-            let payload = Data(bytes: compressedBuffer!, count: Int(compressedSize))
+            let payload = Data(bytes: compBuf, count: Int(compressedSize))
             tcpServer.broadcast(payload: payload, isKeyframe: true, sequenceNumber: seq)
             lastCompressedSize = Int(compressedSize)
         } else {
@@ -344,7 +343,7 @@ class ScreenCapture: NSObject {
                         let y = ty * TILE_SIZE + row
                         let offset = (y * frameWidth + tx * TILE_SIZE) * bpp
                         let rowLen = tileW * bpp
-                        if memcmp(currentRGB! + offset, previousRGB! + offset, rowLen) != 0 {
+                        if memcmp(curBuf + offset, prevBuf + offset, rowLen) != 0 {
                             isDirty = true
                             break
                         }
@@ -366,25 +365,25 @@ class ScreenCapture: NSObject {
                 consecutiveIdleFrames = 0
                 var i = 0
                 while i + 16 <= bufferSize {
-                    let cur = UnsafeRawPointer(currentRGB! + i).loadUnaligned(as: SIMD16<UInt8>.self)
-                    let prev = UnsafeRawPointer(previousRGB! + i).loadUnaligned(as: SIMD16<UInt8>.self)
+                    let cur = UnsafeRawPointer(curBuf + i).loadUnaligned(as: SIMD16<UInt8>.self)
+                    let prev = UnsafeRawPointer(prevBuf + i).loadUnaligned(as: SIMD16<UInt8>.self)
                     let xor = cur ^ prev
-                    UnsafeMutableRawPointer(deltaBuffer! + i).storeBytes(of: xor, as: SIMD16<UInt8>.self)
+                    UnsafeMutableRawPointer(deltaBuf + i).storeBytes(of: xor, as: SIMD16<UInt8>.self)
                     i += 16
                 }
                 while i < bufferSize {
-                    deltaBuffer![i] = currentRGB![i] ^ previousRGB![i]
+                    deltaBuf[i] = curBuf[i] ^ prevBuf[i]
                     i += 1
                 }
                 let compressedSize = LZ4_compress_default(
-                    deltaBuffer!, compressedBuffer!, Int32(bufferSize),
+                    deltaBuf, compBuf, Int32(bufferSize),
                     LZ4_compressBound(Int32(bufferSize))
                 )
                 if compressedSize < TRIVIAL_DELTA_THRESHOLD {
                     skippedFrames += 1
                     frameSequence &-= 1
                 } else {
-                    let payload = Data(bytes: compressedBuffer!, count: Int(compressedSize))
+                    let payload = Data(bytes: compBuf, count: Int(compressedSize))
                     tcpServer.broadcast(payload: payload, isKeyframe: false, sequenceNumber: seq)
                 }
                 lastCompressedSize = Int(compressedSize)
@@ -420,13 +419,13 @@ class ScreenCapture: NSObject {
                             // XOR this tile row
                             var j = 0
                             while j + 16 <= rowLen {
-                                let cur = UnsafeRawPointer(currentRGB! + srcOffset + j).loadUnaligned(as: SIMD16<UInt8>.self)
-                                let prev = UnsafeRawPointer(previousRGB! + srcOffset + j).loadUnaligned(as: SIMD16<UInt8>.self)
+                                let cur = UnsafeRawPointer(curBuf + srcOffset + j).loadUnaligned(as: SIMD16<UInt8>.self)
+                                let prev = UnsafeRawPointer(prevBuf + srcOffset + j).loadUnaligned(as: SIMD16<UInt8>.self)
                                 UnsafeMutableRawPointer(tileDelta + deltaOffset + j).storeBytes(of: cur ^ prev, as: SIMD16<UInt8>.self)
                                 j += 16
                             }
                             while j < rowLen {
-                                tileDelta[deltaOffset + j] = currentRGB![srcOffset + j] ^ previousRGB![srcOffset + j]
+                                tileDelta[deltaOffset + j] = curBuf[srcOffset + j] ^ prevBuf[srcOffset + j]
                                 j += 1
                             }
                             deltaOffset += rowLen
@@ -451,9 +450,8 @@ class ScreenCapture: NSObject {
             }
         }
 
-        let temp = previousRGB
-        previousRGB = currentRGB
-        currentRGB = temp
+        previousRGB = curBuf
+        currentRGB = prevBuf
 
         let t2 = CACurrentMediaTime()
 

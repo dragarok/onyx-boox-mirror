@@ -43,6 +43,9 @@ public class MirrorEngine: ObservableObject {
     @Published public var useColor: Bool = false {
         didSet { UserDefaults.standard.set(useColor, forKey: "useColor") }
     }
+    @Published public var mirrorMode: Bool = false {
+        didSet { UserDefaults.standard.set(mirrorMode, forKey: "mirrorMode") }
+    }
     @Published public var resolution: DisplayResolution {
         didSet { UserDefaults.standard.set(resolution.rawValue, forKey: "resolution") }
     }
@@ -66,6 +69,9 @@ public class MirrorEngine: ObservableObject {
         self.resolution = DisplayResolution(rawValue: saved) ?? .booxBalanced
         if UserDefaults.standard.object(forKey: "useColor") != nil {
             self.useColor = UserDefaults.standard.bool(forKey: "useColor")
+        }
+        if UserDefaults.standard.object(forKey: "mirrorMode") != nil {
+            self.mirrorMode = UserDefaults.standard.bool(forKey: "mirrorMode")
         }
         if UserDefaults.standard.object(forKey: "autoMirrorEnabled") != nil {
             self.autoMirrorEnabled = UserDefaults.standard.bool(forKey: "autoMirrorEnabled")
@@ -250,7 +256,7 @@ public class MirrorEngine: ObservableObject {
         // 1. Virtual display at selected resolution (secondary, not mirror)
         let w = resolution.width
         let h = resolution.height
-        displayManager = VirtualDisplayManager(width: w, height: h, hiDPI: resolution.isHiDPI, mirror: false)
+        displayManager = VirtualDisplayManager(width: w, height: h, hiDPI: resolution.isHiDPI, mirror: mirrorMode)
         try? await Task.sleep(for: .seconds(1))
 
         // 2. In mirror mode this would call mirrorBuiltInDisplay(), but we use secondary mode
