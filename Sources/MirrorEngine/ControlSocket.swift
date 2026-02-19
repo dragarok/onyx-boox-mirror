@@ -2,7 +2,7 @@
 //
 // Accepts newline-terminated text commands on /tmp/daylight-mirror.sock, dispatches
 // to MirrorEngine on the main queue, returns a response, and closes. Runs inside
-// whichever process owns the engine (GUI app or CLI daemon). 11 commands.
+// whichever process owns the engine (GUI app or CLI daemon).
 
 import Foundation
 
@@ -106,15 +106,6 @@ public class ControlSocket {
                 return "OK \(engine.brightness)"
             }
 
-        case "WARMTH":
-            if let arg = arg, let value = Int(arg) {
-                let clamped = max(0, min(255, value))
-                engine.setWarmth(clamped)
-                return "OK \(clamped)"
-            } else {
-                return "OK \(engine.warmth)"
-            }
-
         case "BACKLIGHT":
             let action = arg?.lowercased() ?? ""
             switch action {
@@ -208,28 +199,6 @@ public class ControlSocket {
                 return "ERR not running"
             }
 
-        case "SHARPEN":
-            if let arg = parts.dropFirst().first {
-                guard let val = Double(arg), val >= 0, val <= 3.0 else {
-                    return "ERR value must be 0.0-3.0 (0=none, 1=mild, 2=strong)"
-                }
-                engine.sharpenAmount = val
-                return "OK \(String(format: "%.1f", val))"
-            } else {
-                return "OK \(String(format: "%.1f", engine.sharpenAmount))"
-            }
-
-        case "CONTRAST":
-            if let arg = parts.dropFirst().first {
-                guard let val = Double(arg), val >= 1.0, val <= 2.0 else {
-                    return "ERR value must be 1.0-2.0 (1.0=off, 1.5=moderate, 2.0=high)"
-                }
-                engine.contrastAmount = val
-                return "OK \(String(format: "%.1f", val))"
-            } else {
-                return "OK \(String(format: "%.1f", engine.contrastAmount))"
-            }
-
         case "FONTSMOOTHING":
             if let arg = parts.dropFirst().first?.lowercased() {
                 switch arg {
@@ -246,6 +215,22 @@ public class ControlSocket {
                 }
             } else {
                 return "OK \(engine.fontSmoothingDisabled ? "off" : "on")"
+            }
+
+        case "COLOR":
+            if let arg = arg?.lowercased() {
+                switch arg {
+                case "on":
+                    engine.setColorMode(true)
+                    return "OK on"
+                case "off":
+                    engine.setColorMode(false)
+                    return "OK off"
+                default:
+                    return "ERR use on or off"
+                }
+            } else {
+                return "OK \(engine.useColor ? "on" : "off")"
             }
 
         case "LATENCY":

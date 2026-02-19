@@ -1,8 +1,8 @@
-// mirror_native.c — Daylight Mirror native renderer.
+// mirror_native.c — Boox Mirror native renderer.
 //
-// Receives LZ4+delta compressed greyscale frames over TCP,
-// decompresses, applies delta, and writes directly to ANativeWindow.
-// Entire hot path is C — no JNI calls, no Java GC, no GPU.
+// Receives LZ4+delta compressed RGB frames over TCP,
+// decompresses, applies delta, and renders via GL or ANativeWindow.
+// Entire hot path is C — no JNI calls, no Java GC.
 //
 // Protocol: [0xDA 0x7E] [flags:1B] [seq:4B LE] [length:4B LE] [LZ4 payload]
 //   flags bit 0: 1=keyframe, 0=delta (XOR with previous)
@@ -48,6 +48,8 @@
 #define FRAME_HEADER_SIZE 11
 #define CMD_BRIGHTNESS 0x01
 #define CMD_RESOLUTION 0x04
+#define CMD_COLOR_MODE 0x05
+#define FLAG_TILED     0x02
 
 // Global state
 static ANativeWindow *g_window = NULL;
@@ -60,14 +62,19 @@ static char g_host[64] = "127.0.0.1";
 static int g_port = 8888;
 static int g_sock = -1;
 
+// Color mode: 0=greyscale (1 byte/pixel), 1=RGB (3 bytes/pixel)
+static volatile int g_color_mode = 0;
+static int g_bytes_per_pixel = 1;
+
 // Dynamic frame dimensions (set by CMD_RESOLUTION before first frame)
 static uint32_t g_frame_w = DEFAULT_FRAME_W;
 static uint32_t g_frame_h = DEFAULT_FRAME_H;
 static uint32_t g_pixel_count = DEFAULT_FRAME_W * DEFAULT_FRAME_H;
-static uint32_t g_max_compressed = DEFAULT_FRAME_W * DEFAULT_FRAME_H + 256;
+static uint32_t g_buffer_size = DEFAULT_FRAME_W * DEFAULT_FRAME_H * 1;  // grey: 1 byte/pixel default
+static uint32_t g_max_compressed = DEFAULT_FRAME_W * DEFAULT_FRAME_H * 1 + 256;
 
 // Frame buffers (allocated once, reused — reallocated on resolution change)
-static uint8_t *g_current_frame = NULL;   // Decompressed greyscale pixels
+static uint8_t *g_current_frame = NULL;   // Decompressed RGB pixels
 static uint8_t *g_compressed_buf = NULL;  // Incoming compressed data
 
 static pthread_mutex_t g_frame_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -103,14 +110,28 @@ static const char *k_vertex_shader_src =
     "    v_texcoord = a_texcoord;\n"
     "}\n";
 
-static const char *k_fragment_shader_src =
+// RGB fragment shader — samples .rgb directly
+static const char *k_fragment_shader_rgb =
     "precision mediump float;\n"
     "varying vec2 v_texcoord;\n"
     "uniform sampler2D u_texture;\n"
     "void main() {\n"
-    "    float grey = texture2D(u_texture, v_texcoord).r;\n"
-    "    gl_FragColor = vec4(grey, grey, grey, 1.0);\n"
+    "    vec3 color = texture2D(u_texture, v_texcoord).rgb;\n"
+    "    gl_FragColor = vec4(color, 1.0);\n"
     "}\n";
+
+// Greyscale fragment shader — samples .r (luminance), expands to RGB
+static const char *k_fragment_shader_grey =
+    "precision mediump float;\n"
+    "varying vec2 v_texcoord;\n"
+    "uniform sampler2D u_texture;\n"
+    "void main() {\n"
+    "    float lum = texture2D(u_texture, v_texcoord).r;\n"
+    "    gl_FragColor = vec4(lum, lum, lum, 1.0);\n"
+    "}\n";
+
+// Active fragment shader — set by color mode
+static int g_gl_color_mode = -1;  // track which mode the GL program was built for
 
 static void gl_teardown(void);
 
@@ -139,8 +160,9 @@ static GLuint gl_compile_shader(GLenum type, const char *source) {
 }
 
 static int gl_create_program(void) {
+    const char *frag_src = g_color_mode ? k_fragment_shader_rgb : k_fragment_shader_grey;
     GLuint vertex_shader = gl_compile_shader(GL_VERTEX_SHADER, k_vertex_shader_src);
-    GLuint fragment_shader = gl_compile_shader(GL_FRAGMENT_SHADER, k_fragment_shader_src);
+    GLuint fragment_shader = gl_compile_shader(GL_FRAGMENT_SHADER, frag_src);
     if (!vertex_shader || !fragment_shader) {
         if (vertex_shader) glDeleteShader(vertex_shader);
         if (fragment_shader) glDeleteShader(fragment_shader);
@@ -182,6 +204,7 @@ static int gl_create_program(void) {
         return 0;
     }
 
+    g_gl_color_mode = g_color_mode;
     return 1;
 }
 
@@ -204,11 +227,12 @@ static int gl_create_texture(uint32_t width, uint32_t height) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, (GLsizei)width, (GLsizei)height,
-                 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+    GLenum tex_format = g_color_mode ? GL_RGB : GL_LUMINANCE;
+    glTexImage2D(GL_TEXTURE_2D, 0, (GLint)tex_format, (GLsizei)width, (GLsizei)height,
+                 0, tex_format, GL_UNSIGNED_BYTE, NULL);
 
     if (glGetError() != GL_NO_ERROR) {
-        LOGE("glTexImage2D failed for %ux%u", width, height);
+        LOGE("glTexImage2D failed for %ux%u (format=%s)", width, height, g_color_mode ? "RGB" : "LUMINANCE");
         glDeleteTextures(1, &g_gl_texture);
         g_gl_texture = 0;
         return 0;
@@ -309,6 +333,15 @@ fail:
 
 static int gl_ensure_texture_size(uint32_t width, uint32_t height) {
     if (!g_gl_ready) return 0;
+    // Rebuild program + texture if color mode changed
+    if (g_gl_color_mode != g_color_mode) {
+        if (g_gl_program) { glDeleteProgram(g_gl_program); g_gl_program = 0; }
+        if (!gl_create_program()) return 0;
+        glUseProgram(g_gl_program);
+        glUniform1i(g_gl_uniform_texture, 0);
+        // Force texture recreation with new format
+        g_gl_tex_w = 0; g_gl_tex_h = 0;
+    }
     if (g_gl_texture && g_gl_tex_w == width && g_gl_tex_h == height) return 1;
     return gl_create_texture(width, height);
 }
@@ -397,10 +430,7 @@ static void apply_delta_neon(uint8_t *frame, const uint8_t *delta, int count) {
     }
 }
 
-// Write greyscale directly to ANativeWindow in R8_UNORM format (1 byte/pixel).
-// Falls back to RGBX expansion if R8 is not supported.
-static int g_r8_supported = 0;  // R8_UNORM not compositable by SurfaceFlinger on DC-1
-
+// Write greyscale pixels to ANativeWindow with NEON grey→RGBX expansion (1 byte → 4 bytes per pixel).
 static void blit_grey_to_surface(ANativeWindow *window, const uint8_t *grey) {
     ANativeWindow_Buffer buffer;
     if (ANativeWindow_lock(window, &buffer, NULL) != 0) {
@@ -411,41 +441,69 @@ static void blit_grey_to_surface(ANativeWindow *window, const uint8_t *grey) {
     uint8_t *dst = (uint8_t *)buffer.bits;
     int fw = (int)g_frame_w;
     int fh = (int)g_frame_h;
+    int dst_stride = buffer.stride * 4;
 
-    if (g_r8_supported) {
-        if (buffer.stride == fw && fw <= buffer.width && fh <= buffer.height) {
-            memcpy(dst, grey, (size_t)fw * fh);
-        } else {
-            int dst_stride = buffer.stride;
-            for (int y = 0; y < fh && y < buffer.height; y++) {
-                int w = fw < buffer.width ? fw : buffer.width;
-                memcpy(dst + y * dst_stride, grey + y * fw, w);
-            }
+    for (int y = 0; y < fh && y < buffer.height; y++) {
+        uint8_t *row = dst + y * dst_stride;
+        const uint8_t *src = grey + y * fw;
+        int x = 0;
+        // NEON: process 16 pixels at a time (16 grey bytes → 64 RGBX bytes)
+        for (; x + 16 <= fw && x + 16 <= buffer.width; x += 16) {
+            uint8x16_t g = vld1q_u8(src + x);
+            uint8x16_t ff = vdupq_n_u8(0xFF);
+            uint8x16x4_t rgbx;
+            rgbx.val[0] = g;   // R = grey
+            rgbx.val[1] = g;   // G = grey
+            rgbx.val[2] = g;   // B = grey
+            rgbx.val[3] = ff;  // X = 0xFF
+            vst4q_u8(row + x * 4, rgbx);
         }
-    } else {
-        // Fallback: RGBX_8888 (4 bytes per pixel) with NEON expansion
-        int dst_stride = buffer.stride * 4;
-        for (int y = 0; y < fh && y < buffer.height; y++) {
-            uint8_t *row = dst + y * dst_stride;
-            const uint8_t *src = grey + y * fw;
-            int x = 0;
-            for (; x + 16 <= fw && x + 16 <= buffer.width; x += 16) {
-                uint8x16_t g = vld1q_u8(src + x);
-                uint8x16_t ff = vdupq_n_u8(0xFF);
-                uint8x16x4_t rgbx;
-                rgbx.val[0] = g;
-                rgbx.val[1] = g;
-                rgbx.val[2] = g;
-                rgbx.val[3] = ff;
-                vst4q_u8(row + x * 4, rgbx);
-            }
-            for (; x < fw && x < buffer.width; x++) {
-                uint8_t v = src[x];
-                row[x * 4 + 0] = v;
-                row[x * 4 + 1] = v;
-                row[x * 4 + 2] = v;
-                row[x * 4 + 3] = 0xFF;
-            }
+        for (; x < fw && x < buffer.width; x++) {
+            uint8_t v = src[x];
+            row[x * 4 + 0] = v;     // R
+            row[x * 4 + 1] = v;     // G
+            row[x * 4 + 2] = v;     // B
+            row[x * 4 + 3] = 0xFF;  // X
+        }
+    }
+
+    ANativeWindow_unlockAndPost(window);
+}
+
+// Write RGB pixels to ANativeWindow with RGBX expansion (3 bytes → 4 bytes per pixel).
+static void blit_rgb_to_surface(ANativeWindow *window, const uint8_t *rgb) {
+    ANativeWindow_Buffer buffer;
+    if (ANativeWindow_lock(window, &buffer, NULL) != 0) {
+        LOGE("ANativeWindow_lock failed");
+        return;
+    }
+
+    uint8_t *dst = (uint8_t *)buffer.bits;
+    int fw = (int)g_frame_w;
+    int fh = (int)g_frame_h;
+
+    // RGBX_8888 (4 bytes per pixel) — expand RGB→RGBX with NEON
+    int dst_stride = buffer.stride * 4;
+    for (int y = 0; y < fh && y < buffer.height; y++) {
+        uint8_t *row = dst + y * dst_stride;
+        const uint8_t *src = rgb + y * fw * 3;
+        int x = 0;
+        // NEON: process 16 pixels at a time (48 RGB bytes → 64 RGBX bytes)
+        for (; x + 16 <= fw && x + 16 <= buffer.width; x += 16) {
+            uint8x16x3_t in_rgb = vld3q_u8(src + x * 3);
+            uint8x16_t ff = vdupq_n_u8(0xFF);
+            uint8x16x4_t rgbx;
+            rgbx.val[0] = in_rgb.val[0];  // R
+            rgbx.val[1] = in_rgb.val[1];  // G
+            rgbx.val[2] = in_rgb.val[2];  // B
+            rgbx.val[3] = ff;             // X
+            vst4q_u8(row + x * 4, rgbx);
+        }
+        for (; x < fw && x < buffer.width; x++) {
+            row[x * 4 + 0] = src[x * 3 + 0];  // R
+            row[x * 4 + 1] = src[x * 3 + 1];  // G
+            row[x * 4 + 2] = src[x * 3 + 2];  // B
+            row[x * 4 + 3] = 0xFF;             // X
         }
     }
 
@@ -487,7 +545,7 @@ static void publish_frame(const uint8_t *frame, uint32_t seq) {
 
     const int write_index = (g_ready_index == 0) ? 1 : 0;
     if (g_render_frames[write_index]) {
-        memcpy(g_render_frames[write_index], frame, g_pixel_count);
+        memcpy(g_render_frames[write_index], frame, g_buffer_size);
         if (g_has_ready_frame) g_overwritten_frames += 1;
         g_ready_index = write_index;
         g_ready_seq = seq;
@@ -499,13 +557,14 @@ static void publish_frame(const uint8_t *frame, uint32_t seq) {
 
 static int reallocate_buffers(uint32_t new_w, uint32_t new_h, uint8_t **decompress_buf) {
     uint32_t new_pixels = new_w * new_h;
-    uint32_t new_max_compressed = new_pixels + 256;
+    uint32_t new_buf_size = new_pixels * g_bytes_per_pixel;
+    uint32_t new_max_compressed = new_buf_size + 256;
 
-    uint8_t *new_current = (uint8_t *)calloc(new_pixels, 1);
+    uint8_t *new_current = (uint8_t *)calloc(new_buf_size, 1);
     uint8_t *new_compressed = (uint8_t *)malloc(new_max_compressed);
-    uint8_t *new_decompress = (uint8_t *)malloc(new_pixels);
-    uint8_t *new_render0 = (uint8_t *)malloc(new_pixels);
-    uint8_t *new_render1 = (uint8_t *)malloc(new_pixels);
+    uint8_t *new_decompress = (uint8_t *)malloc(new_buf_size);
+    uint8_t *new_render0 = (uint8_t *)malloc(new_buf_size);
+    uint8_t *new_render1 = (uint8_t *)malloc(new_buf_size);
 
     if (!new_current || !new_compressed || !new_decompress || !new_render0 || !new_render1) {
         free(new_current);
@@ -528,14 +587,15 @@ static int reallocate_buffers(uint32_t new_w, uint32_t new_h, uint8_t **decompre
     *decompress_buf = new_decompress;
     g_render_frames[0] = new_render0;
     g_render_frames[1] = new_render1;
-    memset(g_render_frames[0], 0xFF, new_pixels);
-    memset(g_render_frames[1], 0xFF, new_pixels);
+    memset(g_render_frames[0], 0xFF, new_buf_size);
+    memset(g_render_frames[1], 0xFF, new_buf_size);
     g_ready_index = 0;
     g_has_ready_frame = 0;
 
     g_frame_w = new_w;
     g_frame_h = new_h;
     g_pixel_count = new_pixels;
+    g_buffer_size = new_buf_size;
     g_max_compressed = new_max_compressed;
     pthread_mutex_unlock(&g_frame_mutex);
     return 1;
@@ -560,22 +620,22 @@ static void *render_thread(void *arg) {
         }
 
         const int frame_index = g_ready_index;
-        uint32_t local_pixels = g_pixel_count;
+        uint32_t local_buf_size = g_buffer_size;
         render_w = g_frame_w;
         render_h = g_frame_h;
 
-        if (local_pixels > render_capacity) {
-            uint8_t *resized = (uint8_t *)realloc(render_local, local_pixels);
+        if (local_buf_size > render_capacity) {
+            uint8_t *resized = (uint8_t *)realloc(render_local, local_buf_size);
             if (!resized) {
                 g_has_ready_frame = 0;
                 pthread_mutex_unlock(&g_frame_mutex);
                 continue;
             }
             render_local = resized;
-            render_capacity = local_pixels;
+            render_capacity = local_buf_size;
         }
 
-        memcpy(render_local, g_render_frames[frame_index], local_pixels);
+        memcpy(render_local, g_render_frames[frame_index], local_buf_size);
         g_has_ready_frame = 0;
         pthread_mutex_unlock(&g_frame_mutex);
 
@@ -616,9 +676,10 @@ static void *render_thread(void *arg) {
                                           4 * sizeof(GLfloat), (const void *)(2 * sizeof(GLfloat)));
 
                     clock_gettime(CLOCK_MONOTONIC, &t4a);
+                    GLenum upload_format = g_color_mode ? GL_RGB : GL_LUMINANCE;
                     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
                                     (GLsizei)render_w, (GLsizei)render_h,
-                                    GL_LUMINANCE, GL_UNSIGNED_BYTE, render_local);
+                                    upload_format, GL_UNSIGNED_BYTE, render_local);
                     glDrawArrays(GL_TRIANGLES, 0, 6);
                     clock_gettime(CLOCK_MONOTONIC, &t4b);
 
@@ -634,40 +695,15 @@ static void *render_thread(void *arg) {
             }
 
             if (!did_present) {
-                ANativeWindow_Buffer nbuf;
-                if (ANativeWindow_lock(g_window, &nbuf, NULL) == 0) {
-                    clock_gettime(CLOCK_MONOTONIC, &t4a);
-                    uint8_t *dst = (uint8_t *)nbuf.bits;
-                    int dst_stride = nbuf.stride * 4;
-                    int fw = (int)render_w;
-                    int fh = (int)render_h;
-                    for (int y = 0; y < fh && y < nbuf.height; y++) {
-                        uint8_t *row = dst + y * dst_stride;
-                        const uint8_t *row_src = render_local + y * fw;
-                        int x = 0;
-                        for (; x + 16 <= fw && x + 16 <= nbuf.width; x += 16) {
-                            uint8x16_t g = vld1q_u8(row_src + x);
-                            uint8x16_t ff = vdupq_n_u8(0xFF);
-                            uint8x16x4_t rgbx;
-                            rgbx.val[0] = g;
-                            rgbx.val[1] = g;
-                            rgbx.val[2] = g;
-                            rgbx.val[3] = ff;
-                            vst4q_u8(row + x * 4, rgbx);
-                        }
-                        for (; x < fw && x < nbuf.width; x++) {
-                            uint8_t v = row_src[x];
-                            row[x * 4 + 0] = v;
-                            row[x * 4 + 1] = v;
-                            row[x * 4 + 2] = v;
-                            row[x * 4 + 3] = 0xFF;
-                        }
-                    }
-                    clock_gettime(CLOCK_MONOTONIC, &t4b);
-                    ANativeWindow_unlockAndPost(g_window);
-                    clock_gettime(CLOCK_MONOTONIC, &t5);
-                    did_present = 1;
+                clock_gettime(CLOCK_MONOTONIC, &t4a);
+                if (g_color_mode) {
+                    blit_rgb_to_surface(g_window, render_local);
+                } else {
+                    blit_grey_to_surface(g_window, render_local);
                 }
+                clock_gettime(CLOCK_MONOTONIC, &t4b);
+                clock_gettime(CLOCK_MONOTONIC, &t5);
+                did_present = 1;
             }
 
             if (did_present) {
@@ -689,18 +725,18 @@ static void *decode_thread(void *arg) {
     (void)arg;
     LOGI("Decode thread started, connecting to %s:%d", g_host, g_port);
 
-    g_current_frame = (uint8_t *)calloc(g_pixel_count, 1);
+    g_current_frame = (uint8_t *)calloc(g_buffer_size, 1);
     g_compressed_buf = (uint8_t *)malloc(g_max_compressed);
-    uint8_t *decompress_buf = (uint8_t *)malloc(g_pixel_count);
-    g_render_frames[0] = (uint8_t *)malloc(g_pixel_count);
-    g_render_frames[1] = (uint8_t *)malloc(g_pixel_count);
+    uint8_t *decompress_buf = (uint8_t *)malloc(g_buffer_size);
+    g_render_frames[0] = (uint8_t *)malloc(g_buffer_size);
+    g_render_frames[1] = (uint8_t *)malloc(g_buffer_size);
 
     if (!g_current_frame || !g_compressed_buf || !decompress_buf || !g_render_frames[0] || !g_render_frames[1]) {
         LOGE("Failed to allocate buffers");
         goto cleanup;
     }
-    memset(g_render_frames[0], 0xFF, g_pixel_count);
-    memset(g_render_frames[1], 0xFF, g_pixel_count);
+    memset(g_render_frames[0], 0xFF, g_buffer_size);
+    memset(g_render_frames[1], 0xFF, g_buffer_size);
 
     while (g_running) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -777,6 +813,24 @@ static void *decode_thread(void *arg) {
                     continue;
                 }
 
+                if (cmd == CMD_COLOR_MODE) {
+                    uint8_t mode;
+                    if (read_exact(sock, &mode, 1) < 0) break;
+                    int new_color = mode ? 1 : 0;
+                    if (new_color != g_color_mode) {
+                        g_color_mode = new_color;
+                        g_bytes_per_pixel = new_color ? 3 : 1;
+                        LOGI("Color mode → %s (%d bytes/pixel)", new_color ? "color" : "greyscale", g_bytes_per_pixel);
+                        // Reallocate buffers with new bytes_per_pixel
+                        if (reallocate_buffers(g_frame_w, g_frame_h, &decompress_buf)) {
+                            LOGI("Buffers reallocated for %s mode", new_color ? "color" : "greyscale");
+                        } else {
+                            LOGE("Buffer reallocation failed for color mode change");
+                        }
+                    }
+                    continue;
+                }
+
                 uint8_t value;
                 if (read_exact(sock, &value, 1) < 0) break;
                 if (g_jvm && g_activity) {
@@ -832,28 +886,92 @@ static void *decode_thread(void *arg) {
             }
             clock_gettime(CLOCK_MONOTONIC, &t1);
 
-            int decompressed_size = LZ4_decompress_safe(
-                (const char *)g_compressed_buf,
-                (char *)decompress_buf,
-                payload_len,
-                g_pixel_count
-            );
-            clock_gettime(CLOCK_MONOTONIC, &t2);
+            if (flags & FLAG_TILED) {
+                // Tiled frame: parse header, decompress and apply only dirty tiles
+                if (payload_len < 4) { continue; }
+                const uint8_t *p = g_compressed_buf;
+                uint16_t tile_cols = p[0] | (p[1] << 8);
+                uint16_t tile_rows = p[2] | (p[3] << 8);
+                p += 4;
 
-            if (decompressed_size != (int)g_pixel_count) {
-                LOGE("LZ4 decompress failed: got %d, expected %u", decompressed_size, g_pixel_count);
-                if (flags & FLAG_KEYFRAME) break;
-                continue;
-            }
+                int tile_count = tile_cols * tile_rows;
+                int bitmap_bytes = (tile_count + 7) / 8;
+                if ((uint32_t)(4 + bitmap_bytes) > payload_len) { continue; }
+                const uint8_t *bitmap = p;
+                p += bitmap_bytes;
 
-            if (flags & FLAG_KEYFRAME) {
-                memcpy(g_current_frame, decompress_buf, g_pixel_count);
-            } else if (payload_len < 256) {
-                skipped_deltas += 1;
+                int tile_size = 64;  // TILE_SIZE
+                int bpp = g_bytes_per_pixel;
+                int tile_max_pixels = tile_size * tile_size * bpp;
+
+                for (int ty = 0; ty < tile_rows; ty++) {
+                    int tile_h = tile_size;
+                    if (ty * tile_size + tile_h > (int)g_frame_h)
+                        tile_h = (int)g_frame_h - ty * tile_size;
+                    for (int tx = 0; tx < tile_cols; tx++) {
+                        int tile_idx = ty * tile_cols + tx;
+                        if (!(bitmap[tile_idx / 8] & (1 << (tile_idx % 8)))) continue;
+
+                        int tile_w = tile_size;
+                        if (tx * tile_size + tile_w > (int)g_frame_w)
+                            tile_w = (int)g_frame_w - tx * tile_size;
+
+                        // Read compressed tile length
+                        if ((uint32_t)(p - g_compressed_buf + 4) > payload_len) goto tiled_done;
+                        uint32_t comp_len = p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+                        p += 4;
+                        if ((uint32_t)(p - g_compressed_buf + comp_len) > payload_len) goto tiled_done;
+
+                        // Decompress tile delta
+                        int tile_data_size = tile_w * tile_h * bpp;
+                        int decomp = LZ4_decompress_safe((const char *)p, (char *)decompress_buf,
+                                                         (int)comp_len, tile_max_pixels);
+                        p += comp_len;
+
+                        if (decomp != tile_data_size) {
+                            LOGE("Tile LZ4 decompress failed: got %d, expected %d", decomp, tile_data_size);
+                            continue;
+                        }
+
+                        // Apply XOR delta to tile region in g_current_frame
+                        int delta_offset = 0;
+                        for (int row = 0; row < tile_h; row++) {
+                            int y = ty * tile_size + row;
+                            int frame_offset = (y * (int)g_frame_w + tx * tile_size) * bpp;
+                            int row_len = tile_w * bpp;
+                            apply_delta_neon(g_current_frame + frame_offset,
+                                             decompress_buf + delta_offset, row_len);
+                            delta_offset += row_len;
+                        }
+                    }
+                }
+                tiled_done:
+                clock_gettime(CLOCK_MONOTONIC, &t2);
+                clock_gettime(CLOCK_MONOTONIC, &t3);
             } else {
-                apply_delta_neon(g_current_frame, decompress_buf, g_pixel_count);
+                int decompressed_size = LZ4_decompress_safe(
+                    (const char *)g_compressed_buf,
+                    (char *)decompress_buf,
+                    payload_len,
+                    g_buffer_size
+                );
+                clock_gettime(CLOCK_MONOTONIC, &t2);
+
+                if (decompressed_size != (int)g_buffer_size) {
+                    LOGE("LZ4 decompress failed: got %d, expected %u", decompressed_size, g_buffer_size);
+                    if (flags & FLAG_KEYFRAME) break;
+                    continue;
+                }
+
+                if (flags & FLAG_KEYFRAME) {
+                    memcpy(g_current_frame, decompress_buf, g_buffer_size);
+                } else if (payload_len < 256) {
+                    skipped_deltas += 1;
+                } else {
+                    apply_delta_neon(g_current_frame, decompress_buf, g_buffer_size);
+                }
+                clock_gettime(CLOCK_MONOTONIC, &t3);
             }
-            clock_gettime(CLOCK_MONOTONIC, &t3);
 
             send_ack(sock, seq);
             publish_frame(g_current_frame, seq);
@@ -916,7 +1034,7 @@ static void *decode_thread(void *arg) {
         LOGI("Disconnected, reconnecting in 1s...");
 
         if (g_current_frame) {
-            memset(g_current_frame, 0xFF, g_pixel_count);
+            memset(g_current_frame, 0xFF, g_buffer_size);
             publish_frame(g_current_frame, g_ready_seq + 1);
         }
 

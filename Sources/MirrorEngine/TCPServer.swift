@@ -1,8 +1,8 @@
 // TCPServer.swift — Native TCP frame server for Daylight Mirror.
 //
-// Sends LZ4-compressed greyscale frames to connected Android clients over raw TCP.
+// Sends LZ4-compressed RGB frames to connected Android clients over raw TCP.
 // Protocol: [DA 7E] [flags] [len:4 LE] [payload]. Keyframes are full LZ4, deltas
-// are XOR + LZ4. Also sends resolution and brightness/warmth commands.
+// are XOR + LZ4. Also sends resolution and brightness commands.
 
 import Foundation
 import Network
@@ -27,6 +27,7 @@ class TCPServer {
     var onClientCountChanged: ((Int) -> Void)?
     var onLatencyStats: ((LatencyStats) -> Void)?
     private(set) var latencyStats: LatencyStats?
+    var isColorMode: Bool = false
     var frameWidth: UInt16 = 1024 {
         didSet { lock.lock(); lastKeyframeData = nil; lock.unlock() }
     }
@@ -81,8 +82,9 @@ class TCPServer {
                     self.rttLock.unlock()
                     self.onClientCountChanged?(count)
 
-                    // Tell client our frame dimensions before sending any frames
+                    // Tell client our frame dimensions and color mode before sending any frames
                     self.sendResolution(to: conn)
+                    self.sendColorMode(to: conn)
 
                     if let kf = cachedKeyframe {
                         conn.send(content: kf, completion: .contentProcessed { _ in })
@@ -194,10 +196,10 @@ class TCPServer {
         }
     }
 
-    func broadcast(payload: Data, isKeyframe: Bool, sequenceNumber: UInt32 = 0) {
+    func broadcast(payload: Data, isKeyframe: Bool, sequenceNumber: UInt32 = 0, flags: UInt8? = nil) {
         var header = Data(capacity: FRAME_HEADER_SIZE)
         header.append(contentsOf: MAGIC_FRAME)
-        header.append(isKeyframe ? FLAG_KEYFRAME : 0)
+        header.append(flags ?? (isKeyframe ? FLAG_KEYFRAME : 0))
         var seq = sequenceNumber.littleEndian
         header.append(Data(bytes: &seq, count: 4))
         var len = UInt32(payload.count).littleEndian
@@ -257,5 +259,25 @@ class TCPServer {
         packet.append(Data(bytes: &h, count: 2))
         conn.send(content: packet, completion: .contentProcessed { _ in })
         print("[TCP] Sent resolution: \(self.frameWidth)x\(self.frameHeight)")
+    }
+
+    /// Send color mode command to a specific client: [DA 7F] [05] [mode]
+    func sendColorMode(to conn: NWConnection) {
+        var packet = Data(capacity: 4)
+        packet.append(contentsOf: MAGIC_CMD)
+        packet.append(CMD_COLOR_MODE)
+        packet.append(isColorMode ? 1 : 0)
+        conn.send(content: packet, completion: .contentProcessed { _ in })
+    }
+
+    /// Broadcast color mode to all connected clients.
+    func sendColorMode() {
+        lock.lock()
+        let conns = connections
+        lock.unlock()
+        for conn in conns {
+            sendColorMode(to: conn)
+        }
+        print("[TCP] Sent color mode: \(isColorMode ? "color" : "greyscale")")
     }
 }

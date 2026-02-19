@@ -1,8 +1,9 @@
 // VirtualDisplayManager.swift — Virtual display creation via CGVirtualDisplay.
 //
-// Creates a virtual display at the given resolution and mirrors the Mac's built-in
-// display to it. Uses CGVirtualDisplay private API (same as BetterDisplay, DeskPad).
-// With hiDPI=true, macOS renders at 2x — e.g. 1600x1200 pixels at 800x600 logical points.
+// Creates a virtual display at the given resolution. When mirror=true, mirrors the
+// Mac's built-in display. When mirror=false, creates an independent secondary display.
+// Uses CGVirtualDisplay private API (same as BetterDisplay, DeskPad).
+// With hiDPI=true, macOS renders at 2x — e.g. 1240x930 pixels at 620x465 logical points.
 // The virtual display disappears when this object is deallocated.
 
 import Foundation
@@ -13,14 +14,16 @@ class VirtualDisplayManager {
     let displayID: CGDirectDisplayID
     let width: UInt
     let height: UInt
+    let mirror: Bool
 
-    init(width: UInt, height: UInt, hiDPI: Bool = false) {
+    init(width: UInt, height: UInt, hiDPI: Bool = false, mirror: Bool = false) {
         self.width = width
         self.height = height
+        self.mirror = mirror
 
         let descriptor = CGVirtualDisplayDescriptor()
         descriptor.setDispatchQueue(DispatchQueue.main)
-        descriptor.name = "Daylight DC-1"
+        descriptor.name = "Boox Mirror"
         descriptor.maxPixelsWide = UInt32(width)
         descriptor.maxPixelsHigh = UInt32(height)
         descriptor.sizeInMillimeters = CGSize(
@@ -38,7 +41,7 @@ class VirtualDisplayManager {
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = hiDPI ? 1 : 0
         settings.modes = [
-            CGVirtualDisplayMode(width: width, height: height, refreshRate: 60)
+            CGVirtualDisplayMode(width: width, height: height, refreshRate: CGFloat(TARGET_FPS))
         ]
 
         guard virtualDisplay.apply(settings) else {
@@ -46,10 +49,16 @@ class VirtualDisplayManager {
             return
         }
         let modeLabel = hiDPI ? "HiDPI (\(width/2)x\(height/2)pt @ 2x)" : "non-HiDPI"
-        print("Virtual display configured: \(width)x\(height) \(modeLabel) @ 60Hz")
+        let mirrorLabel = mirror ? "mirror" : "secondary"
+        print("Virtual display configured: \(width)x\(height) \(modeLabel) @ \(TARGET_FPS)Hz (\(mirrorLabel))")
     }
 
     func mirrorBuiltInDisplay() {
+        guard mirror else {
+            print("Secondary display mode — skipping mirror setup (arrange in System Settings > Displays)")
+            return
+        }
+
         var displayIDs = [CGDirectDisplayID](repeating: 0, count: 32)
         var displayCount: UInt32 = 0
         CGGetOnlineDisplayList(32, &displayIDs, &displayCount)

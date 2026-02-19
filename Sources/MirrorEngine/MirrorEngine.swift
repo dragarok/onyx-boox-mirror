@@ -1,11 +1,11 @@
-// MirrorEngine.swift — Core orchestrator for Daylight Mirror.
+// MirrorEngine.swift — Core orchestrator for Boox Mirror.
 //
 // Coordinates: virtual display creation, screen capture, TCP/WS/HTTP servers,
-// display controls (brightness, warmth, backlight), ADB bridge, USB device
-// monitoring, and the control socket for CLI integration.
+// display controls (brightness, backlight), ADB bridge, USB device monitoring,
+// and the control socket for CLI integration.
 //
 // Used by both the CLI (`daylight-mirror`) and the menu bar app (`DaylightMirror`).
-// All heavy lifting is zero-GPU: vImage SIMD greyscale + LZ4 delta compression.
+// All heavy lifting is zero-GPU: RGB capture + LZ4 delta compression.
 //
 // Individual components live in their own files (see Configuration.swift,
 // ADBBridge.swift, ScreenCapture.swift, etc.). This file contains only the
@@ -24,35 +24,25 @@ public class MirrorEngine: ObservableObject {
     @Published public var fps: Double = 0
     @Published public var bandwidth: Double = 0
     @Published public var brightness: Int = 128
-    @Published public var warmth: Int = 128
     @Published public var backlightOn: Bool = true
     @Published public var adbConnected: Bool = false
     @Published public var apkInstallStatus: String = ""  // Empty = idle, "Installing..." = in progress, "Installed" = done, or error
     @Published public var clientCount: Int = 0
     @Published public var totalFrames: Int = 0
     @Published public var frameSizeKB: Int = 0
-    @Published public var greyMs: Double = 0      // Greyscale + sharpen time per frame
+    @Published public var greyMs: Double = 0      // RGB conversion time per frame
     @Published public var compressMs: Double = 0   // LZ4 delta compress time per frame
     @Published public var jitterMs: Double = 0     // SCStream delivery jitter (deviation from expected interval)
     @Published public var rttMs: Double = 0        // Round-trip latency (Mac send → Android ACK)
     @Published public var rttP95Ms: Double = 0     // 95th percentile RTT
     @Published public var skippedFrames: Int = 0  // Frames skipped due to Android backpressure
-    @Published public var sharpenAmount: Double = 1.0 {
-        didSet {
-            capture?.sharpenAmount = sharpenAmount
-            UserDefaults.standard.set(sharpenAmount, forKey: "sharpenAmount")
-        }
-    }
-    @Published public var contrastAmount: Double = 1.0 {
-        didSet {
-            capture?.contrastAmount = contrastAmount
-            UserDefaults.standard.set(contrastAmount, forKey: "contrastAmount")
-        }
-    }
     @Published public var fontSmoothingDisabled: Bool = false
     @Published public var deviceDetected: Bool = false
     @Published public var updateVersion: String? = nil
     @Published public var updateURL: String? = nil
+    @Published public var useColor: Bool = false {
+        didSet { UserDefaults.standard.set(useColor, forKey: "useColor") }
+    }
     @Published public var resolution: DisplayResolution {
         didSet { UserDefaults.standard.set(resolution.rawValue, forKey: "resolution") }
     }
@@ -66,7 +56,6 @@ public class MirrorEngine: ObservableObject {
     private var compositorPacer: CompositorPacer?
     private var controlSocket: ControlSocket?
     private var usbMonitor: USBDeviceMonitor?
-    private var savedMacBrightness: Float?   // Mac brightness before auto-dim
     /// When true, auto-start/stop mirroring based on USB device state.
     @Published public var autoMirrorEnabled: Bool = true {
         didSet { UserDefaults.standard.set(autoMirrorEnabled, forKey: "autoMirrorEnabled") }
@@ -74,16 +63,14 @@ public class MirrorEngine: ObservableObject {
 
     public init() {
         let saved = UserDefaults.standard.string(forKey: "resolution") ?? ""
-        self.resolution = DisplayResolution(rawValue: saved) ?? .sharp
-        let savedSharpen = UserDefaults.standard.double(forKey: "sharpenAmount")
-        self.sharpenAmount = savedSharpen > 0 ? savedSharpen : 1.0
-        let savedContrast = UserDefaults.standard.double(forKey: "contrastAmount")
-        self.contrastAmount = savedContrast > 0 ? savedContrast : 1.0
+        self.resolution = DisplayResolution(rawValue: saved) ?? .booxBalanced
+        if UserDefaults.standard.object(forKey: "useColor") != nil {
+            self.useColor = UserDefaults.standard.bool(forKey: "useColor")
+        }
         if UserDefaults.standard.object(forKey: "autoMirrorEnabled") != nil {
             self.autoMirrorEnabled = UserDefaults.standard.bool(forKey: "autoMirrorEnabled")
         }
-        NSLog("[MirrorEngine] init, resolution: %@, sharpen: %.1f, contrast: %.1f",
-              resolution.rawValue, sharpenAmount, contrastAmount)
+        NSLog("[MirrorEngine] init, resolution: %@, color: %d", resolution.rawValue, useColor ? 1 : 0)
 
         // Control socket — always listening so CLI can send START/STOP/etc.
         // Started after init completes (self is fully initialized).
@@ -246,7 +233,7 @@ public class MirrorEngine: ObservableObject {
     public func start() async {
         guard status == .idle || status != .starting else { return }
 
-        // Disable font smoothing for cleaner greyscale rendering on e-ink
+        // Disable font smoothing for cleaner rendering on e-ink
         if fontSmoothingDisabled {
             setFontSmoothing(enabled: false)
         }
@@ -260,14 +247,14 @@ public class MirrorEngine: ObservableObject {
 
         status = .starting
 
-        // 1. Virtual display at selected resolution
+        // 1. Virtual display at selected resolution (secondary, not mirror)
         let w = resolution.width
         let h = resolution.height
-        displayManager = VirtualDisplayManager(width: w, height: h, hiDPI: resolution.isHiDPI)
+        displayManager = VirtualDisplayManager(width: w, height: h, hiDPI: resolution.isHiDPI, mirror: false)
         try? await Task.sleep(for: .seconds(1))
 
-        // 3. Mirroring
-        displayManager?.mirrorBuiltInDisplay()
+        // 2. In mirror mode this would call mirrorBuiltInDisplay(), but we use secondary mode
+        displayManager?.mirrorBuiltInDisplay()  // No-op when mirror=false
         try? await Task.sleep(for: .seconds(1))
 
         // 3b. Compositor pacer — forces display compositor to deliver frames at TARGET_FPS.
@@ -281,25 +268,10 @@ public class MirrorEngine: ObservableObject {
             let tcp = try TCPServer(port: TCP_PORT)
             tcp.frameWidth = UInt16(w)
             tcp.frameHeight = UInt16(h)
+            tcp.isColorMode = useColor
             tcp.onClientCountChanged = { [weak self] count in
                 DispatchQueue.main.async {
-                    let wasConnected = (self?.clientCount ?? 0) > 0
                     self?.clientCount = count
-
-                    // Auto-dim Mac when Daylight connects, restore when it disconnects
-                    if count > 0 && !wasConnected {
-                        if let current = MacBrightness.get() {
-                            self?.savedMacBrightness = current
-                            MacBrightness.set(0)
-                            print("[Mac] Auto-dimmed (was \(current))")
-                        }
-                    } else if count == 0 && wasConnected {
-                        if let saved = self?.savedMacBrightness {
-                            MacBrightness.set(saved)
-                            self?.savedMacBrightness = nil
-                            print("[Mac] Brightness restored to \(saved)")
-                        }
-                    }
                 }
             }
             tcp.onLatencyStats = { [weak self] stats in
@@ -337,10 +309,8 @@ public class MirrorEngine: ObservableObject {
         let cap = ScreenCapture(
             tcpServer: tcpServer!, wsServer: wsServer!,
             targetDisplayID: displayManager!.displayID,
-            width: Int(w), height: Int(h)
+            width: Int(w), height: Int(h), useColor: useColor
         )
-        cap.sharpenAmount = sharpenAmount
-        cap.contrastAmount = contrastAmount
         cap.onStats = { [weak self] fps, bw, frameKB, total, grey, compress, jitter, skipped in
             DispatchQueue.main.async {
                 self?.fps = fps
@@ -378,9 +348,6 @@ public class MirrorEngine: ObservableObject {
         dc.onBrightnessChanged = { [weak self] val in
             DispatchQueue.main.async { self?.brightness = val }
         }
-        dc.onWarmthChanged = { [weak self] val in
-            DispatchQueue.main.async { self?.warmth = val }
-        }
         dc.onBacklightChanged = { [weak self] on in
             DispatchQueue.main.async { self?.backlightOn = on }
         }
@@ -389,7 +356,6 @@ public class MirrorEngine: ObservableObject {
 
         // Sync initial values
         brightness = dc.currentBrightness
-        warmth = dc.currentWarmth
         backlightOn = dc.backlightOn
 
         status = .running
@@ -461,13 +427,6 @@ public class MirrorEngine: ObservableObject {
         guard status == .running || status == .waitingForDevice else { return }
         if status == .waitingForDevice { status = .idle; return }
         DispatchQueue.main.async { self.status = .stopping }
-
-        // Restore Mac brightness before tearing down
-        if let saved = savedMacBrightness {
-            MacBrightness.set(saved)
-            savedMacBrightness = nil
-            print("[Mac] Brightness restored to \(saved)")
-        }
 
         Task {
             // Stop in reverse order (control socket stays alive — it's engine-lifetime)
@@ -551,11 +510,6 @@ public class MirrorEngine: ObservableObject {
         backlightOn = brightness > 0
     }
 
-    public func setWarmth(_ value: Int) {
-        displayController?.setWarmth(value)
-        warmth = max(0, min(255, value))
-    }
-
     public func toggleBacklight() {
         displayController?.toggleBacklight()
         if let dc = displayController {
@@ -564,8 +518,17 @@ public class MirrorEngine: ObservableObject {
         }
     }
 
-    /// Disable macOS font smoothing (subpixel AA). Dramatically improves text clarity
-    /// on greyscale displays like the Daylight DC-1. Restored when mirror stops.
+    /// Switch between greyscale (default, fast) and color mode.
+    public func setColorMode(_ enabled: Bool) {
+        useColor = enabled
+        capture?.setColorMode(enabled)
+        tcpServer?.isColorMode = enabled
+        tcpServer?.sendColorMode()
+        print("[Engine] Color mode: \(enabled ? "on" : "off")")
+    }
+
+    /// Disable macOS font smoothing (subpixel AA). Improves text clarity
+    /// on e-ink displays. Restored when mirror stops.
     public func setFontSmoothing(enabled: Bool) {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")

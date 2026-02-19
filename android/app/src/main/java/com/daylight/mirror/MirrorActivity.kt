@@ -63,14 +63,14 @@ class MirrorActivity : Activity() {
 
         // Status overlay — shown when waiting for connection
         statusTitle = TextView(this).apply {
-            text = "Waiting for Mac..."
+            text = "Waiting for connection..."
             textSize = 18f
             setTextColor(Color.DKGRAY)
             gravity = Gravity.CENTER_HORIZONTAL
         }
         statusHint = TextView(this).apply {
             text = "1. Connect USB cable\n" +
-                "2. Open Daylight Mirror on Mac\n" +
+                "2. Open Mirror app on Mac\n" +
                 "3. Start via menu bar or Ctrl+F8"
             textSize = 14f
             setTextColor(Color.GRAY)
@@ -157,9 +157,9 @@ class MirrorActivity : Activity() {
                         // After 8 more seconds of disconnect, escalate to full waiting screen
                         handler.postDelayed({
                             if (!isConnected) {
-                                statusTitle.text = "Waiting for Mac..."
+                                statusTitle.text = "Waiting for connection..."
                                 statusHint.text = "1. Check USB cable\n" +
-                                    "2. Open Daylight Mirror on Mac\n" +
+                                    "2. Open Mirror app on Mac\n" +
                                     "3. Start via menu bar or Ctrl+F8"
                                 statusHint.visibility = View.VISIBLE
                             }

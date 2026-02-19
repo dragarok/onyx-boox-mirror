@@ -163,9 +163,9 @@ struct SetupView: View {
             }
 
             VStack(alignment: .leading, spacing: 12) {
-                featureRow("bolt.fill", "60 FPS, under 11ms latency")
-                featureRow("eye", "Lossless greyscale — no compression artifacts")
-                featureRow("keyboard", "Shortcuts for brightness, warmth, and more")
+                featureRow("bolt.fill", "24 FPS, LZ4 delta compression")
+                featureRow("eye", "Greyscale default (3x faster), color toggle available")
+                featureRow("keyboard", "Shortcuts for brightness and more")
             }
             .padding(.horizontal, 60)
             .padding(.top, 8)
@@ -222,7 +222,7 @@ struct SetupView: View {
                     granted: hasAccessibility,
                     icon: "keyboard",
                     title: "Accessibility",
-                    description: "Enables Ctrl+F key shortcuts for brightness and warmth",
+                    description: "Enables Ctrl+F key shortcuts for brightness",
                     action: {
                         MirrorEngine.requestAccessibilityPermission()
                         startPermissionPolling()
@@ -313,10 +313,10 @@ struct SetupView: View {
                 .font(.title2.weight(.medium))
 
             VStack(alignment: .leading, spacing: 12) {
-                howItWorksRow("1", "Connect your Daylight DC-1 via USB-C")
+                howItWorksRow("1", "Connect your device via USB-C")
                 howItWorksRow("2", "Click Start Mirror in the menu bar (or press Ctrl+F8)")
-                howItWorksRow("3", "Your Mac creates a virtual 4:3 display and starts streaming")
-                howItWorksRow("4", "The Daylight app launches automatically — your Mac dims")
+                howItWorksRow("3", "Your Mac creates a virtual secondary display and starts streaming")
+                howItWorksRow("4", "The mirror app launches automatically on the device")
             }
             .padding(.horizontal, 50)
 
@@ -329,7 +329,7 @@ struct SetupView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Text("Auto-reconnect detects your Daylight when plugged in")
+                Text("Auto-reconnect detects your device when plugged in")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
 
@@ -456,8 +456,6 @@ struct MirrorMenuView: View {
                         shortcutGroup("F1", "F2", label: "Brightness")
                         Spacer()
                         shortcutPill("F10", label: "Backlight")
-                        Spacer()
-                        shortcutGroup("F11", "F12", label: "Warmth")
                     }
                 } else {
                     HStack {
@@ -519,7 +517,7 @@ struct MirrorMenuView: View {
     var statusText: String {
         switch engine.status {
         case .idle: return "Idle"
-        case .waitingForDevice: return "Waiting for DC-1"
+        case .waitingForDevice: return "Waiting for device"
         case .starting: return "Starting"
         case .running: return "Running"
         case .stopping: return "Stopping"
@@ -552,11 +550,12 @@ struct MirrorMenuView: View {
         if showDetailedStats {
             VStack(spacing: 4) {
                 statsRow("Resolution", "\(engine.resolution.rawValue)\(engine.resolution.isHiDPI ? " HiDPI" : "")")
+                statsRow("Mode", engine.useColor ? "rgb" : "grey")
                 statsRow("Frame size", "\(engine.frameSizeKB) KB")
                 statsRow("Total frames", "\(engine.totalFrames)")
-                statsRow("Grey + sharpen", String(format: "%.1f ms", engine.greyMs))
+                statsRow("RGB convert", String(format: "%.1f ms", engine.greyMs))
                 statsRow("LZ4 compress", String(format: "%.1f ms", engine.compressMs))
-                statsRow("Frame budget", String(format: "%.0f%%", (engine.greyMs + engine.compressMs) / (1000.0 / 60.0) * 100))
+                statsRow("Frame budget", String(format: "%.0f%%", (engine.greyMs + engine.compressMs) / (1000.0 / 24.0) * 100))
             }
             .padding(.horizontal, 4)
             .padding(.vertical, 4)
@@ -569,7 +568,7 @@ struct MirrorMenuView: View {
                 .fill(engine.clientCount > 0 ? .green : .orange)
                 .frame(width: 6, height: 6)
             Text(engine.clientCount > 0
-                 ? "Daylight connected"
+                 ? "Device connected"
                  : engine.apkInstallStatus.isEmpty
                     ? "Waiting for client..."
                     : engine.apkInstallStatus)
@@ -628,23 +627,6 @@ struct MirrorMenuView: View {
             }
         }
 
-        // Warmth slider
-        VStack(alignment: .leading, spacing: 2) {
-            HStack {
-                Image(systemName: "snowflake")
-                    .font(.caption2)
-                Slider(
-                    value: Binding(
-                        get: { Double(engine.warmth) },
-                        set: { engine.setWarmth(Int($0)) }
-                    ),
-                    in: 0...255
-                )
-                Image(systemName: "flame")
-                    .font(.caption2)
-            }
-        }
-
         // Backlight toggle
         Toggle(isOn: Binding(
             get: { engine.backlightOn },
@@ -658,28 +640,16 @@ struct MirrorMenuView: View {
 
         Divider()
 
-        // Sharpening slider (0-1.5)
-        VStack(alignment: .leading, spacing: 2) {
-            HStack {
-                Image(systemName: "circle.dashed")
-                    .font(.caption2)
-                Slider(
-                    value: Binding(
-                        get: { engine.sharpenAmount },
-                        set: { engine.sharpenAmount = $0 }
-                    ),
-                    in: 0...1.5,
-                    step: 0.1
-                )
-                Image(systemName: "diamond")
-                    .font(.caption2)
-            }
-            Text("Sharpen: \(String(format: "%.1f", engine.sharpenAmount))")
-                .font(.system(size: 9))
-                .foregroundStyle(.tertiary)
+        // Color mode toggle
+        Toggle(isOn: Binding(
+            get: { engine.useColor },
+            set: { engine.setColorMode($0) }
+        )) {
+            Label("Color mode", systemImage: "paintpalette")
+                .font(.caption)
         }
-
-        Divider()
+        .toggleStyle(.switch)
+        .controlSize(.small)
 
         // Auto-reconnect toggle
         Toggle(isOn: $engine.autoMirrorEnabled) {
@@ -732,7 +702,7 @@ struct MirrorMenuView: View {
                     .font(.title3)
                     .foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Connect your Daylight")
+                    Text("Connect your device")
                         .font(.callout.weight(.medium))
                     Text("Plug in a USB-C cable to start mirroring automatically")
                         .font(.caption)
@@ -789,7 +759,7 @@ struct MirrorMenuView: View {
                 Circle()
                     .fill(engine.deviceDetected ? .green : .gray)
                     .frame(width: 6, height: 6)
-                Text(engine.deviceDetected ? "DC-1 detected via USB" : "No device connected")
+                Text(engine.deviceDetected ? "Device detected via USB" : "No device connected")
                     .font(.caption)
                     .foregroundStyle(engine.deviceDetected ? .primary : .secondary)
             }

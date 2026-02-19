@@ -1,7 +1,7 @@
-// CompositorPacer.swift — Dirty pixel trick to force 60fps frame delivery.
+// CompositorPacer.swift — Dirty pixel trick to force frame delivery at TARGET_FPS.
 //
 // Forces the macOS compositor to continuously redraw by toggling a 4x4 pixel
-// window between two nearly-identical colors at 60Hz. Without this, CGDisplayStream
+// window between two nearly-identical colors at TARGET_FPS Hz. Without this, CGDisplayStream
 // only delivers ~13fps for mirrored virtual displays because WindowServer
 // considers static content "clean" and skips recompositing.
 //
@@ -79,15 +79,15 @@ class CompositorPacer {
         if let targetScreen = targetScreen {
             let dl = targetScreen.displayLink(target: self, selector: #selector(tick))
             dl.preferredFrameRateRange = CAFrameRateRange(
-                minimum: 30, maximum: 60, preferred: 60
+                minimum: 15, maximum: Float(TARGET_FPS), preferred: Float(TARGET_FPS)
             )
             dl.add(to: .main, forMode: .common)
             self.displayLink = dl
             print("[Pacer] Started on virtual display \(targetDisplayID) (CADisplayLink, 4x4)")
         } else {
-            // Fallback: DispatchSourceTimer at ~30Hz
+            // Fallback: DispatchSourceTimer at ~24Hz
             let t = DispatchSource.makeTimerSource(queue: .main)
-            t.schedule(deadline: .now(), repeating: .milliseconds(16))
+            t.schedule(deadline: .now(), repeating: .milliseconds(42))
             t.setEventHandler { [weak self] in
                 self?.timerTick()
             }
@@ -113,8 +113,8 @@ class CompositorPacer {
             ? NSColor(red: 0, green: 0, blue: 0, alpha: 1)
             : NSColor(red: 1.0 / 255.0, green: 0, blue: 0, alpha: 1)
         tickCount += 1
-        if tickCount % 300 == 0 {
-            print("[Pacer] \(tickCount) ticks (~\(tickCount / 60)s)")
+        if tickCount % 120 == 0 {
+            print("[Pacer] \(tickCount) ticks (~\(tickCount / UInt64(TARGET_FPS))s)")
         }
     }
 
