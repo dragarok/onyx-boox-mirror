@@ -62,6 +62,7 @@ public enum DisplayResolution: String, CaseIterable, Identifiable {
 let MAGIC_FRAME: [UInt8] = [0xDA, 0x7E]
 let MAGIC_CMD: [UInt8] = [0xDA, 0x7F]
 let MAGIC_ACK: [UInt8] = [0xDA, 0x7A]  // ACK from Android → Mac for RTT measurement
+let MAGIC_TOUCH: [UInt8] = [0xDA, 0x7B]  // Touch event from Android → Mac
 let FLAG_KEYFRAME: UInt8 = 0x01
 let CMD_BRIGHTNESS: UInt8 = 0x01
 let CMD_WARMTH: UInt8 = 0x02

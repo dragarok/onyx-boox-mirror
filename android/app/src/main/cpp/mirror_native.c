@@ -52,6 +52,7 @@
 #define CMD_COLOR_MODE 0x05
 #define CMD_REFRESH    0x06
 #define FLAG_TILED     0x02
+#define MAGIC_TOUCH_1  0x7B
 
 // Global state
 static ANativeWindow *g_window = NULL;
@@ -510,6 +511,39 @@ static void blit_rgb_to_surface(ANativeWindow *window, const uint8_t *rgb) {
     }
 
     ANativeWindow_unlockAndPost(window);
+}
+
+// Send touch event to Mac: [DA 7B] [action:1] [xNorm:2 LE] [yNorm:2 LE]
+static void send_touch_event(int action, int x_norm, int y_norm) {
+    int sock = g_sock;
+    if (sock < 0) return;
+    uint8_t packet[7];
+    packet[0] = MAGIC_FRAME_0;   // 0xDA
+    packet[1] = MAGIC_TOUCH_1;   // 0x7B
+    packet[2] = (uint8_t)action;
+    packet[3] = (uint8_t)(x_norm & 0xFF);
+    packet[4] = (uint8_t)((x_norm >> 8) & 0xFF);
+    packet[5] = (uint8_t)(y_norm & 0xFF);
+    packet[6] = (uint8_t)((y_norm >> 8) & 0xFF);
+    send(sock, packet, 7, MSG_NOSIGNAL);
+}
+
+// Send scroll event to Mac: [DA 7B] [3] [xNorm:2 LE] [yNorm:2 LE] [deltaY:2 LE signed]
+static void send_scroll_event(int x_norm, int y_norm, int delta_y) {
+    int sock = g_sock;
+    if (sock < 0) return;
+    uint8_t packet[9];
+    packet[0] = MAGIC_FRAME_0;
+    packet[1] = MAGIC_TOUCH_1;
+    packet[2] = 3;  // ACTION_SCROLL
+    packet[3] = (uint8_t)(x_norm & 0xFF);
+    packet[4] = (uint8_t)((x_norm >> 8) & 0xFF);
+    packet[5] = (uint8_t)(y_norm & 0xFF);
+    packet[6] = (uint8_t)((y_norm >> 8) & 0xFF);
+    int16_t dy = (int16_t)delta_y;
+    packet[7] = (uint8_t)(dy & 0xFF);
+    packet[8] = (uint8_t)((dy >> 8) & 0xFF);
+    send(sock, packet, 9, MSG_NOSIGNAL);
 }
 
 static void send_ack(int sock, uint32_t seq) {
@@ -1101,6 +1135,22 @@ Java_com_daylight_mirror_MirrorActivity_nativeStart(
     g_running = 1;
     pthread_create(&g_render_thread, NULL, render_thread, NULL);
     pthread_create(&g_decode_thread, NULL, decode_thread, NULL);
+}
+
+// JNI: called from Kotlin to forward touch events to Mac
+JNIEXPORT void JNICALL
+Java_com_daylight_mirror_MirrorActivity_nativeSendTouch(
+    JNIEnv *env, jobject thiz, jint action, jint x_norm, jint y_norm)
+{
+    send_touch_event(action, x_norm, y_norm);
+}
+
+// JNI: called from Kotlin to forward two-finger scroll to Mac
+JNIEXPORT void JNICALL
+Java_com_daylight_mirror_MirrorActivity_nativeSendScroll(
+    JNIEnv *env, jobject thiz, jint x_norm, jint y_norm, jint delta_y)
+{
+    send_scroll_event(x_norm, y_norm, delta_y);
 }
 
 // JNI: called from Kotlin when Surface is destroyed

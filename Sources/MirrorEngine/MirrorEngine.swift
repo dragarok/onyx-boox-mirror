@@ -60,6 +60,7 @@ public class MirrorEngine: ObservableObject {
     private var compositorPacer: CompositorPacer?
     private var controlSocket: ControlSocket?
     private var usbMonitor: USBDeviceMonitor?
+    private var touchInjector: TouchInjector?
     /// When true, auto-start/stop mirroring based on USB device state.
     @Published public var autoMirrorEnabled: Bool = true {
         didSet { UserDefaults.standard.set(autoMirrorEnabled, forKey: "autoMirrorEnabled") }
@@ -287,6 +288,13 @@ public class MirrorEngine: ObservableObject {
                     self?.rttP95Ms = stats.rttP95Ms
                 }
             }
+            // Touch injection — forward Boox touches to Mac virtual display
+            let injector = TouchInjector(displayID: displayManager!.displayID)
+            tcp.onTouchEvent = { [weak injector] action, xNorm, yNorm, scrollDelta in
+                injector?.handleTouch(action: action, xNorm: xNorm, yNorm: yNorm, scrollDelta: scrollDelta)
+            }
+            touchInjector = injector
+
             tcp.start()
             tcpServer = tcp
 
@@ -443,6 +451,8 @@ public class MirrorEngine: ObservableObject {
             // Stop in reverse order (control socket stays alive — it's engine-lifetime)
             displayController?.stop()
             displayController = nil
+
+            touchInjector = nil
 
             compositorPacer?.stop()
             compositorPacer = nil

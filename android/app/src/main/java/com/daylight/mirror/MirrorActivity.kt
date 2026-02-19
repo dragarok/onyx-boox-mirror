@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -31,6 +32,8 @@ class MirrorActivity : Activity() {
 
     private external fun nativeStart(surface: Surface, host: String, port: Int)
     private external fun nativeStop()
+    private external fun nativeSendTouch(action: Int, xNorm: Int, yNorm: Int)
+    private external fun nativeSendScroll(xNorm: Int, yNorm: Int, deltaY: Int)
 
     private lateinit var statusTitle: TextView
     private lateinit var statusHint: TextView
@@ -204,6 +207,58 @@ class MirrorActivity : Activity() {
     @Suppress("unused")
     fun refreshScreen() {
         sendBroadcast(Intent("android.onyx.action.FULL_REFRESH"))
+    }
+
+    private var scrollMode = false
+    private var lastScrollY = 0f
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        val screenW = resources.displayMetrics.widthPixels.toFloat()
+        val screenH = resources.displayMetrics.heightPixels.toFloat()
+
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (!scrollMode) {
+                    nativeSendTouch(0, norm(event.x, screenW), norm(event.y, screenH))
+                }
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                // Second finger → enter scroll mode, cancel any pending click
+                if (!scrollMode) {
+                    nativeSendTouch(1, norm(event.x, screenW), norm(event.y, screenH))
+                }
+                scrollMode = true
+                lastScrollY = (event.getY(0) + event.getY(1)) / 2f
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (scrollMode && event.pointerCount >= 2) {
+                    val midX = (event.getX(0) + event.getX(1)) / 2f
+                    val midY = (event.getY(0) + event.getY(1)) / 2f
+                    val deltaY = (midY - lastScrollY).toInt()
+                    if (Math.abs(deltaY) >= 2) {
+                        nativeSendScroll(norm(midX, screenW), norm(midY, screenH), deltaY)
+                        lastScrollY = midY
+                    }
+                } else if (!scrollMode) {
+                    nativeSendTouch(2, norm(event.x, screenW), norm(event.y, screenH))
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (scrollMode) {
+                    scrollMode = false
+                } else {
+                    nativeSendTouch(1, norm(event.x, screenW), norm(event.y, screenH))
+                }
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                // One finger lifted — stay in scroll mode until all fingers up
+            }
+        }
+        return true
+    }
+
+    private fun norm(value: Float, max: Float): Int {
+        return ((value / max) * 65535).toInt().coerceIn(0, 65535)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

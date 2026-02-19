@@ -26,6 +26,7 @@ class TCPServer {
     var lastKeyframeData: Data?
     var onClientCountChanged: ((Int) -> Void)?
     var onLatencyStats: ((LatencyStats) -> Void)?
+    var onTouchEvent: ((UInt8, UInt16, UInt16, Int16) -> Void)?
     private(set) var latencyStats: LatencyStats?
     var isColorMode: Bool = false
     var frameWidth: UInt16 = 1024 {
@@ -136,63 +137,99 @@ class TCPServer {
 
         var scanned = 0
         while ackParseBuffer.count >= 6 {
-            guard ackParseBuffer[ackParseBuffer.startIndex] == MAGIC_ACK[0]
-                    && ackParseBuffer[ackParseBuffer.index(ackParseBuffer.startIndex, offsetBy: 1)] == MAGIC_ACK[1] else {
+            let base = ackParseBuffer.startIndex
+            guard ackParseBuffer[base] == 0xDA else {
                 ackParseBuffer.removeFirst()
                 scanned += 1
-                if scanned > 256 {
-                    ackParseBuffer.removeAll()
-                    return
+                if scanned > 256 { ackParseBuffer.removeAll(); return }
+                continue
+            }
+
+            let type = ackParseBuffer[ackParseBuffer.index(base, offsetBy: 1)]
+
+            if type == MAGIC_ACK[1] {
+                // ACK packet: [DA 7A] [seq:4 LE] = 6 bytes
+                let b0 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 2)])
+                let b1 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 3)]) << 8
+                let b2 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 4)]) << 16
+                let b3 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 5)]) << 24
+                let seq = b0 | b1 | b2 | b3
+                ackParseBuffer.removeFirst(6)
+                scanned = 0
+
+                let now = CACurrentMediaTime()
+
+                guard let sendTime = sendTimestamps.removeValue(forKey: seq) else {
+                    continue
                 }
-                continue
+                _inflightFrames -= 1
+                if _inflightFrames < 0 { _inflightFrames = 0 }
+                let rtt = (now - sendTime) * 1000.0
+                rttSamples.append(rtt)
+                if rttSamples.count > rttWindowSize {
+                    rttSamples.removeFirst(rttSamples.count - rttWindowSize)
+                }
+                totalAcks += 1
+
+                let sorted = rttSamples.sorted()
+                let avg = sorted.reduce(0, +) / Double(sorted.count)
+                let p95Index = min(Int(Double(sorted.count) * 0.95), sorted.count - 1)
+
+                let elapsed = now - lastAckStatsTime
+                let rate = elapsed > 0 ? Double(totalAcks) / elapsed : 0
+
+                let stats = LatencyStats(
+                    rttMs: rtt,
+                    rttMinMs: sorted.first ?? 0,
+                    rttMaxMs: sorted.last ?? 0,
+                    rttAvgMs: avg,
+                    rttP95Ms: sorted[p95Index],
+                    acksReceived: totalAcks,
+                    ackRate: rate
+                )
+
+                if totalAcks % 30 == 0 {
+                    print(String(format: "[RTT] last: %.1fms | avg: %.1fms | p95: %.1fms | min: %.1fms | max: %.1fms | acks: %d",
+                                 stats.rttMs, stats.rttAvgMs, stats.rttP95Ms, stats.rttMinMs, stats.rttMaxMs, stats.acksReceived))
+                }
+
+                latencyStats = stats
+                onLatencyStats?(stats)
+
+            } else if type == MAGIC_TOUCH[1] {
+                // Touch: [DA 7B] [action:1] [xNorm:2 LE] [yNorm:2 LE] = 7 bytes
+                // Scroll: [DA 7B] [3] [xNorm:2 LE] [yNorm:2 LE] [deltaY:2 LE] = 9 bytes
+                guard ackParseBuffer.count >= 7 else { break }
+                let action = ackParseBuffer[ackParseBuffer.index(base, offsetBy: 2)]
+
+                if action == 3 {
+                    // Scroll needs 9 bytes
+                    guard ackParseBuffer.count >= 9 else { break }
+                    let xNorm = UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 3)])
+                           | UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 4)]) << 8
+                    let yNorm = UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 5)])
+                           | UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 6)]) << 8
+                    let deltaY = Int16(bitPattern:
+                        UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 7)])
+                      | UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 8)]) << 8)
+                    ackParseBuffer.removeFirst(9)
+                    scanned = 0
+                    onTouchEvent?(action, xNorm, yNorm, deltaY)
+                } else {
+                    let xNorm = UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 3)])
+                           | UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 4)]) << 8
+                    let yNorm = UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 5)])
+                           | UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 6)]) << 8
+                    ackParseBuffer.removeFirst(7)
+                    scanned = 0
+                    onTouchEvent?(action, xNorm, yNorm, 0)
+                }
+
+            } else {
+                ackParseBuffer.removeFirst()
+                scanned += 1
+                if scanned > 256 { ackParseBuffer.removeAll(); return }
             }
-
-            let base = ackParseBuffer.startIndex
-            let b0 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 2)])
-            let b1 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 3)]) << 8
-            let b2 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 4)]) << 16
-            let b3 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 5)]) << 24
-            let seq = b0 | b1 | b2 | b3
-            ackParseBuffer.removeFirst(6)
-
-            let now = CACurrentMediaTime()
-
-            guard let sendTime = sendTimestamps.removeValue(forKey: seq) else {
-                continue
-            }
-            _inflightFrames -= 1
-            if _inflightFrames < 0 { _inflightFrames = 0 }
-            let rtt = (now - sendTime) * 1000.0
-            rttSamples.append(rtt)
-            if rttSamples.count > rttWindowSize {
-                rttSamples.removeFirst(rttSamples.count - rttWindowSize)
-            }
-            totalAcks += 1
-
-            let sorted = rttSamples.sorted()
-            let avg = sorted.reduce(0, +) / Double(sorted.count)
-            let p95Index = min(Int(Double(sorted.count) * 0.95), sorted.count - 1)
-
-            let elapsed = now - lastAckStatsTime
-            let rate = elapsed > 0 ? Double(totalAcks) / elapsed : 0
-
-            let stats = LatencyStats(
-                rttMs: rtt,
-                rttMinMs: sorted.first ?? 0,
-                rttMaxMs: sorted.last ?? 0,
-                rttAvgMs: avg,
-                rttP95Ms: sorted[p95Index],
-                acksReceived: totalAcks,
-                ackRate: rate
-            )
-
-            if totalAcks % 30 == 0 {
-                print(String(format: "[RTT] last: %.1fms | avg: %.1fms | p95: %.1fms | min: %.1fms | max: %.1fms | acks: %d",
-                             stats.rttMs, stats.rttAvgMs, stats.rttP95Ms, stats.rttMinMs, stats.rttMaxMs, stats.acksReceived))
-            }
-
-            latencyStats = stats
-            onLatencyStats?(stats)
         }
     }
 
