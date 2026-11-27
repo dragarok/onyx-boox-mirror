@@ -19,6 +19,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         NSLog("[AppDelegate] didFinishLaunching")
         engine.setupGlobalShortcut()
 
+        // Safety net: if a previous crash left disablesleep=1, restore it on launch.
+        // Only runs the sudo prompt if SleepDisabled is actually stuck on.
+        engine.restoreSleepIfNeeded()
+
         // Show setup window if first run or permissions missing
         if !MirrorEngine.setupCompleted || !MirrorEngine.allPermissionsGranted {
             showSetupWindow()
@@ -113,6 +117,8 @@ struct SetupView: View {
     @State private var hasScreenRecording = MirrorEngine.hasScreenRecordingPermission()
     @State private var hasAccessibility = MirrorEngine.hasAccessibilityPermission()
     @State private var pollTimer: Timer?
+    @State private var notifyEmail: String = ""
+    @State private var emailSubmitted = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -163,9 +169,9 @@ struct SetupView: View {
             }
 
             VStack(alignment: .leading, spacing: 12) {
-                featureRow("bolt.fill", "60 FPS, LZ4 delta compression")
-                featureRow("eye", "Greyscale default (3x faster), color toggle available")
-                featureRow("keyboard", "Shortcuts for brightness and more")
+                featureRow("bolt.fill", "60 FPS, under 11ms latency")
+                featureRow("eye", "Lossless greyscale — no compression artifacts")
+                featureRow("keyboard", "Shortcuts for brightness, warmth, and more")
             }
             .padding(.horizontal, 60)
             .padding(.top, 8)
@@ -222,7 +228,7 @@ struct SetupView: View {
                     granted: hasAccessibility,
                     icon: "keyboard",
                     title: "Accessibility",
-                    description: "Enables Ctrl+F key shortcuts for brightness",
+                    description: "Enables Ctrl+F key shortcuts for brightness and warmth",
                     action: {
                         MirrorEngine.requestAccessibilityPermission()
                         startPermissionPolling()
@@ -313,10 +319,10 @@ struct SetupView: View {
                 .font(.title2.weight(.medium))
 
             VStack(alignment: .leading, spacing: 12) {
-                howItWorksRow("1", "Connect your device via USB-C")
+                howItWorksRow("1", "Connect your Daylight DC-1 via USB-C")
                 howItWorksRow("2", "Click Start Mirror in the menu bar (or press Ctrl+F8)")
-                howItWorksRow("3", "Your Mac creates a virtual secondary display and starts streaming")
-                howItWorksRow("4", "The mirror app launches automatically on the device")
+                howItWorksRow("3", "Your Mac creates a virtual 4:3 display and starts streaming")
+                howItWorksRow("4", "The Daylight app launches automatically — your Mac dims")
             }
             .padding(.horizontal, 50)
 
@@ -329,7 +335,7 @@ struct SetupView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Text("Auto-reconnect detects your device when plugged in")
+                Text("Auto-reconnect detects your Daylight when plugged in")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
 
@@ -355,6 +361,35 @@ struct SetupView: View {
 
             Spacer()
 
+            // Optional email signup for update notifications
+            VStack(spacing: 8) {
+                if emailSubmitted {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Text("You'll be notified of major updates")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("Get notified of major updates")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        TextField("Email (optional)", text: $notifyEmail)
+                            .textFieldStyle(.roundedBorder)
+                            .controlSize(.small)
+                            .frame(width: 200)
+                            .onSubmit { submitEmail() }
+                        Button("Subscribe") { submitEmail() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(notifyEmail.isEmpty || !notifyEmail.contains("@"))
+                    }
+                }
+            }
+            .padding(.bottom, 8)
+
             Button(action: {
                 pollTimer?.invalidate()
                 onComplete()
@@ -366,6 +401,25 @@ struct SetupView: View {
             .controlSize(.large)
             .padding(.bottom, 32)
         }
+    }
+
+    private func submitEmail() {
+        let email = notifyEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !email.isEmpty, email.contains("@") else { return }
+
+        var request = URLRequest(url: URL(string: "https://daylight-notify.potential.workers.dev/subscribe")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let payload: [String: String] = [
+            "email": email,
+            "version": MirrorEngine.appVersion,
+            "source": "app"
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+
+        URLSession.shared.dataTask(with: request) { _, _, _ in
+            DispatchQueue.main.async { emailSubmitted = true }
+        }.resume()
     }
 
     func howItWorksRow(_ number: String, _ text: String) -> some View {
@@ -450,14 +504,14 @@ struct MirrorMenuView: View {
                     .font(.system(size: 9))
                     .foregroundStyle(.tertiary)
                 if engine.status == .running {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 6) {
                         shortcutPill("F8", label: "Mirror")
                         Spacer()
-                        shortcutGroup("F1", "F2", label: "Bright")
+                        shortcutGroup("F1", "F2", label: "Brightness")
                         Spacer()
-                        shortcutGroup("F3", "F4", label: "Warm")
+                        shortcutPill("F10", label: "Backlight")
                         Spacer()
-                        shortcutPill("F5", label: "Refresh")
+                        shortcutGroup("F11", "F12", label: "Warmth")
                     }
                 } else {
                     HStack {
@@ -470,26 +524,66 @@ struct MirrorMenuView: View {
             Divider()
 
             HStack {
-                Button("Quit") {
-                    engine.stop()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        NSApp.terminate(nil)
+                if showQuitConfirm {
+                    Text("Quit?")
+                        .font(.caption.weight(.medium))
+                    Button("Yes") {
+                        engine.stop()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            NSApp.terminate(nil)
+                        }
                     }
-                }
-                .font(.caption)
-                Spacer()
-                Button("Setup") { showSetup() }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                     .buttonStyle(.plain)
-                Spacer()
-                Link("GitHub", destination: URL(string: "https://github.com/welfvh/daylight-mirror")!)
+                    .font(.caption.weight(.medium))
+                    Button("No") {
+                        showQuitConfirm = false
+                    }
+                    .buttonStyle(.plain)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                } else {
+                    Button("Quit") {
+                        showQuitConfirm = true
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                }
+                Spacer()
+                Button("Feedback") {
+                    NSWorkspace.shared.open(URL(string: "https://github.com/welfvh/daylight-mirror/issues")!)
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Spacer()
+                Button("Support") {
+                    NSWorkspace.shared.open(URL(string: "mailto:w+mirror@welf.co")!)
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Spacer()
+                Button("About") {
+                    NSWorkspace.shared.open(URL(string: "https://welf.ai/mirror")!)
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
         }
         .padding()
         .frame(width: 280)
+        .background {
+            // ESC to dismiss — catches key events even when no focused text field
+            Button("") { dismissMenuBar() }
+                .keyboardShortcut(.escape, modifiers: [])
+                .hidden()
+        }
+    }
+
+    /// Dismiss the MenuBarExtra window by deactivating the app.
+    private func dismissMenuBar() {
+        NSApp.deactivate()
     }
 
     // MARK: - Status Badge
@@ -509,8 +603,8 @@ struct MirrorMenuView: View {
     var statusColor: Color {
         switch engine.status {
         case .idle: return .gray
-        case .waitingForDevice: return .orange
-        case .starting, .stopping: return .orange
+        case .waitingForDevice: return .secondary
+        case .starting, .stopping: return .secondary
         case .running: return .green
         case .error: return .red
         }
@@ -519,9 +613,9 @@ struct MirrorMenuView: View {
     var statusText: String {
         switch engine.status {
         case .idle: return "Idle"
-        case .waitingForDevice: return "Waiting for device"
+        case .waitingForDevice: return "Waiting"
         case .starting: return "Starting"
-        case .running: return "Running"
+        case .running: return hasDC1 ? "DC-1 connected" : "Running"
         case .stopping: return "Stopping"
         case .error: return "Error"
         }
@@ -530,85 +624,66 @@ struct MirrorMenuView: View {
     // MARK: - Running View
 
     @State private var showDetailedStats = false
+    @State private var showSpeedStats = false
+    @State private var showClamshellConfirm = false
+    @State private var showClamshellConfirmIdle = false
+
+    /// Whether any DC-1 device is among the active sessions.
+    private var hasDC1: Bool { engine.sessions.contains { $0.device.deviceFamily == .daylightDC1 } }
+
+    @State private var showQuitConfirm = false
 
     @ViewBuilder
     var runningView: some View {
-        // Stats — tap to expand
-        Button(action: { withAnimation(.easeInOut(duration: 0.15)) { showDetailedStats.toggle() } }) {
-            HStack {
-                Label(String(format: "%.0f FPS", engine.fps), systemImage: "speedometer")
-                Spacer()
-                Text(String(format: "%.1f MB/s", engine.bandwidth))
-                    .foregroundStyle(.secondary)
-                Image(systemName: showDetailedStats ? "chevron.up" : "chevron.down")
-                    .font(.system(size: 8))
-                    .foregroundStyle(.tertiary)
-            }
-            .font(.caption)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-
-        if showDetailedStats {
-            VStack(spacing: 4) {
-                statsRow("Resolution", "\(engine.resolution.rawValue)\(engine.resolution.isHiDPI ? " HiDPI" : "")")
-                statsRow("Mode", engine.useColor ? "rgb" : "grey")
-                statsRow("Frame size", "\(engine.frameSizeKB) KB")
-                statsRow("Total frames", "\(engine.totalFrames)")
-                statsRow("RGB convert", String(format: "%.1f ms", engine.greyMs))
-                statsRow("LZ4 compress", String(format: "%.1f ms", engine.compressMs))
-                statsRow("Frame budget", String(format: "%.0f%%", (engine.greyMs + engine.compressMs) / (1000.0 / 60.0) * 100))
-            }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.5)))
-        }
-
-        // Client status
-        HStack(spacing: 6) {
-            Circle()
-                .fill(engine.clientCount > 0 ? .green : .orange)
-                .frame(width: 6, height: 6)
-            Text(engine.clientCount > 0
-                 ? "Device connected"
-                 : engine.apkInstallStatus.isEmpty
-                    ? "Waiting for client..."
-                    : engine.apkInstallStatus)
-                .font(.caption)
-            Spacer()
-            if engine.adbConnected {
-                Label("USB", systemImage: "cable.connector")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
-
-        Divider()
-
-        // Resolution (change triggers restart)
-        Picker("Resolution", selection: Binding(
-            get: { engine.resolution },
-            set: { newRes in
-                engine.resolution = newRes
-                engine.stop()
-                Task { @MainActor in
-                    try? await Task.sleep(for: .seconds(0.5))
-                    await engine.start()
+        // DC-1: resolution picker + mode on one row
+        if hasDC1 {
+            HStack(spacing: 6) {
+                Picker("", selection: Binding(
+                    get: { engine.resolution },
+                    set: { newRes in
+                        guard newRes != engine.resolution else { return }
+                        engine.resolution = newRes
+                        restartEngine()
+                    }
+                )) {
+                    Section("Landscape") {
+                        ForEach(DisplayResolution.allCases.filter { !$0.isPortrait }) { res in
+                            Text("\(res.label) (\(res.rawValue))").tag(res)
+                        }
+                    }
+                    Section("Portrait") {
+                        ForEach(DisplayResolution.allCases.filter { $0.isPortrait }) { res in
+                            Text("\(res.label) (\(res.rawValue))").tag(res)
+                        }
+                    }
                 }
-            }
-        )) {
-            ForEach(DisplayResolution.allCases) { res in
-                Text("\(res.label) (\(res.rawValue))").tag(res)
+                .pickerStyle(.menu)
+                .controlSize(.small)
+                .labelsHidden()
+
+                Picker("", selection: Binding(
+                    get: { engine.displayMode },
+                    set: { newMode in
+                        guard newMode != engine.displayMode else { return }
+                        engine.displayMode = newMode
+                        restartEngine()
+                    }
+                )) {
+                    Text("Mirror").tag(DisplayMode.mirror)
+                    Text("Extend").tag(DisplayMode.extended)
+                }
+                .pickerStyle(.segmented)
+                .controlSize(.small)
+                .labelsHidden()
+                .clipShape(RoundedRectangle(cornerRadius: 6))
             }
         }
-        .pickerStyle(.menu)
-        .controlSize(.small)
-        .padding(.vertical, 2)
 
-        Divider()
+        // DC-1 display controls (brightness, warmth)
+        if hasDC1 {
+            Divider()
 
-        // Brightness slider
-        VStack(alignment: .leading, spacing: 2) {
+            // Brightness slider (quadratic curve with widened low-end zone)
             HStack {
                 Image(systemName: "sun.min")
                     .font(.caption2)
@@ -627,86 +702,171 @@ struct MirrorMenuView: View {
                 Image(systemName: "sun.max")
                     .font(.caption2)
             }
-        }
 
-        // Warmth slider
-        VStack(alignment: .leading, spacing: 2) {
+            // Warmth slider
             HStack {
-                Image(systemName: "thermometer.snowflake")
+                Image(systemName: "snowflake")
                     .font(.caption2)
                 Slider(
                     value: Binding(
-                        get: { Double(engine.warmth) / 255.0 },
-                        set: { engine.setWarmth(Int($0 * 255.0)) }
+                        get: { Double(engine.warmth) },
+                        set: { engine.setWarmth(Int($0)) }
                     ),
-                    in: 0...1
+                    in: 0...255
                 )
-                Image(systemName: "thermometer.sun")
+                Image(systemName: "flame")
                     .font(.caption2)
             }
-        }
-
-        HStack {
-            // Backlight toggle
-            Toggle(isOn: Binding(
-                get: { engine.backlightOn },
-                set: { _ in engine.toggleBacklight() }
-            )) {
-                Label("Backlight", systemImage: "lightbulb")
-                    .font(.caption)
-            }
-            .toggleStyle(.switch)
-            .controlSize(.small)
-
-            Spacer()
-
-            // Full refresh button
-            Button(action: { engine.refreshScreen() }) {
-                Label("Refresh", systemImage: "arrow.clockwise")
-                    .font(.caption)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
         }
 
         Divider()
 
-        // Color mode toggle
-        Toggle(isOn: Binding(
-            get: { engine.useColor },
-            set: { engine.setColorMode($0) }
-        )) {
-            Label("Color mode", systemImage: "paintpalette")
-                .font(.caption)
+        // Collapsible "More" section: settings, sharpen, stats
+        Button(action: { showDetailedStats.toggle() }) {
+            HStack {
+                Text("More")
+                Spacer()
+                Image(systemName: showDetailedStats ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.tertiary)
+            }
+            .font(.caption)
+            .contentShape(Rectangle())
         }
-        .toggleStyle(.switch)
-        .controlSize(.small)
+        .buttonStyle(.plain)
 
-        // Mirror / Secondary display toggle (requires restart)
-        Toggle(isOn: Binding(
-            get: { engine.mirrorMode },
-            set: { newVal in
-                engine.mirrorMode = newVal
-                engine.stop()
-                Task { @MainActor in
-                    try? await Task.sleep(for: .seconds(0.5))
-                    await engine.start()
+        if showDetailedStats {
+            VStack(alignment: .leading, spacing: 6) {
+                // Settings
+                HStack {
+                    Label("Dim Mac display", systemImage: "display")
+                        .font(.caption)
+                    Spacer()
+                    Toggle("", isOn: $engine.autoDimMac)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .labelsHidden()
+                }
+
+                HStack {
+                    Label {
+                        Text("Auto-reconnect on USB")
+                    } icon: {
+                        Image(systemName: "cable.connector")
+                            .frame(width: 14, alignment: .center)
+                    }
+                    .font(.caption)
+                    Spacer()
+                    Toggle("", isOn: $engine.autoMirrorEnabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .labelsHidden()
+                }
+
+                clamshellToggle(confirmState: $showClamshellConfirm)
+
+                Divider()
+
+                // Display profile picker
+                HStack {
+                    Label("Profile", systemImage: "slider.horizontal.3")
+                        .font(.caption)
+                    Spacer()
+                    Picker("", selection: $engine.displayProfile) {
+                        ForEach(DisplayProfile.allCases) { profile in
+                            Text(profile.rawValue).tag(profile)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .controlSize(.small)
+                    .labelsHidden()
+                    .frame(width: 120)
+                }
+
+                // Sharpening slider (visible in Custom mode, read-only label in presets)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Image(systemName: "circle.dashed")
+                            .font(.caption2)
+                        Slider(
+                            value: Binding(
+                                get: { engine.sharpenAmount },
+                                set: { engine.sharpenAmount = $0 }
+                            ),
+                            in: 0...3.0,
+                            step: 0.1
+                        )
+                        Image(systemName: "diamond")
+                            .font(.caption2)
+                    }
+                    Text("Sharpen: \(String(format: "%.1f", engine.sharpenAmount))")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+
+                // Contrast slider
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Image(systemName: "circle.lefthalf.filled")
+                            .font(.caption2)
+                        Slider(
+                            value: Binding(
+                                get: { engine.contrastAmount },
+                                set: { engine.contrastAmount = $0 }
+                            ),
+                            in: 0.5...1.8,
+                            step: 0.1
+                        )
+                        Image(systemName: "circle.righthalf.filled")
+                            .font(.caption2)
+                    }
+                    Text("Contrast: \(String(format: "%.1f", engine.contrastAmount))")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+
+                Divider()
+
+                // Collapsible speed/stats section
+                Button(action: { showSpeedStats.toggle() }) {
+                    HStack {
+                        Text("Speed")
+                        if !showSpeedStats {
+                            Text(String(format: "%.0f FPS", engine.fps))
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
+                        Image(systemName: showSpeedStats ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 8))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .font(.caption)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                if showSpeedStats {
+                    HStack {
+                        Label(String(format: "%.0f FPS", engine.fps), systemImage: "speedometer")
+                        Spacer()
+                        Text(String(format: "%.1f MB/s", engine.bandwidth))
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.caption)
+
+                    VStack(spacing: 4) {
+                        statsRow("Frame size", "\(engine.frameSizeKB) KB")
+                        statsRow("Total frames", "\(engine.totalFrames)")
+                        statsRow("Grey + sharpen", String(format: "%.1f ms", engine.greyMs))
+                        statsRow("LZ4 compress", String(format: "%.1f ms", engine.compressMs))
+                        statsRow("Frame budget", String(format: "%.0f%%", (engine.greyMs + engine.compressMs) / (1000.0 / 60.0) * 100))
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 4)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.5)))
                 }
             }
-        )) {
-            Label(engine.mirrorMode ? "Mirror mode" : "Secondary display", systemImage: engine.mirrorMode ? "rectangle.on.rectangle" : "display.2")
-                .font(.caption)
         }
-        .toggleStyle(.switch)
-        .controlSize(.small)
-
-        // Auto-reconnect toggle
-        Toggle(isOn: $engine.autoMirrorEnabled) {
-            Label("Auto-reconnect on USB", systemImage: "cable.connector")
-                .font(.caption)
-        }
-        .toggleStyle(.switch)
-        .controlSize(.small)
 
         Divider()
 
@@ -719,13 +879,7 @@ struct MirrorMenuView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
 
-            Button(action: {
-                engine.stop()
-                Task { @MainActor in
-                    try? await Task.sleep(for: .seconds(0.5))
-                    await engine.start()
-                }
-            }) {
+            Button(action: { restartEngine() }) {
                 Text("Restart")
                     .frame(maxWidth: .infinity)
             }
@@ -741,6 +895,47 @@ struct MirrorMenuView: View {
         }
     }
 
+    // MARK: - Device Row
+
+    @ViewBuilder
+    func deviceRow(_ session: DeviceSession) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "display")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(session.device.deviceFamily.rawValue)
+                    .font(.caption.weight(.medium))
+                HStack(spacing: 4) {
+                    Text(session.resolution.rawValue)
+                    Text("·")
+                    Text(session.displayMode == .mirror ? "Mirror" : "Extended")
+                }
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
+            }
+
+            Spacer()
+
+            Circle()
+                .fill(session.clientCount > 0 ? Color.primary : Color.secondary)
+                .frame(width: 6, height: 6)
+        }
+        .padding(.vertical, 2)
+    }
+
+    // MARK: - Restart Helper
+
+    private func restartEngine() {
+        engine.stop()
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(0.5))
+            await engine.start()
+        }
+    }
+
     // MARK: - Waiting for Device View
 
     @ViewBuilder
@@ -751,7 +946,7 @@ struct MirrorMenuView: View {
                     .font(.title3)
                     .foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Connect your device")
+                    Text("Connect your Daylight")
                         .font(.callout.weight(.medium))
                     Text("Plug in a USB-C cable to start mirroring automatically")
                         .font(.caption)
@@ -802,52 +997,136 @@ struct MirrorMenuView: View {
 
     @ViewBuilder
     var idleView: some View {
-        VStack(spacing: 8) {
-            // Device detection status
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(engine.deviceDetected ? .green : .gray)
-                    .frame(width: 6, height: 6)
-                Text(engine.deviceDetected ? "Device detected via USB" : "No device connected")
-                    .font(.caption)
-                    .foregroundStyle(engine.deviceDetected ? .primary : .secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            Divider()
-
-            // Mirror / Secondary display toggle
-            Toggle(isOn: $engine.mirrorMode) {
-                Label(engine.mirrorMode ? "Mirror mode" : "Secondary display", systemImage: engine.mirrorMode ? "rectangle.on.rectangle" : "display.2")
-                    .font(.caption)
-            }
-            .toggleStyle(.switch)
-            .controlSize(.small)
-
-            // Resolution picker
-            Picker("Resolution", selection: $engine.resolution) {
-                ForEach(DisplayResolution.allCases) { res in
-                    Text("\(res.label) (\(res.rawValue))").tag(res)
+        // Resolution picker + mode (matches running view layout)
+        HStack(spacing: 6) {
+            Picker("", selection: $engine.resolution) {
+                Section("Landscape") {
+                    ForEach(DisplayResolution.allCases.filter { !$0.isPortrait }) { res in
+                        Text("\(res.label) (\(res.rawValue))").tag(res)
+                    }
+                }
+                Section("Portrait") {
+                    ForEach(DisplayResolution.allCases.filter { $0.isPortrait }) { res in
+                        Text("\(res.label) (\(res.rawValue))").tag(res)
+                    }
                 }
             }
             .pickerStyle(.menu)
             .controlSize(.small)
-            .padding(.vertical, 2)
+            .labelsHidden()
 
-            Divider()
-
-            Button(action: {
-                if !MirrorEngine.hasScreenRecordingPermission() {
-                    showSetup()
-                } else {
-                    Task { await engine.start() }
-                }
-            }) {
-                Text("Start Mirror")
-                    .frame(maxWidth: .infinity)
+            Picker("", selection: $engine.displayMode) {
+                Text("Mirror").tag(DisplayMode.mirror)
+                Text("Extend").tag(DisplayMode.extended)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.regular)
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+            .labelsHidden()
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+
+        Divider()
+
+        // Settings — match running view layout
+        HStack {
+            Label {
+                Text("Auto-reconnect on USB")
+            } icon: {
+                Image(systemName: "cable.connector")
+                    .frame(width: 14, alignment: .center)
+            }
+            .font(.caption)
+            Spacer()
+            Toggle("", isOn: $engine.autoMirrorEnabled)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+        }
+
+        HStack {
+            Label("Dim Mac display", systemImage: "display")
+                .font(.caption)
+            Spacer()
+            Toggle("", isOn: $engine.autoDimMac)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+        }
+
+        clamshellToggle(confirmState: $showClamshellConfirmIdle)
+
+        Divider()
+
+        Button(action: {
+            if !MirrorEngine.hasScreenRecordingPermission() {
+                showSetup()
+            } else {
+                Task { await engine.start() }
+            }
+        }) {
+            Text("Start Mirror")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.regular)
+    }
+
+    // MARK: - Clamshell Toggle (inline confirmation)
+
+    @ViewBuilder
+    func clamshellToggle(confirmState: Binding<Bool>) -> some View {
+        if confirmState.wrappedValue {
+            // Inline confirmation — stays inside the menu bar window
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Image(systemName: "cup.and.saucer")
+                        .font(.caption)
+                    Text("Keep Mac awake with lid closed?")
+                        .font(.caption.weight(.medium))
+                }
+                Text("Higher battery usage while on battery.\nNo automatic screen lock.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button("Enable") {
+                        engine.clamshellModeEnabled = true
+                        confirmState.wrappedValue = false
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    Button("Cancel") {
+                        confirmState.wrappedValue = false
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.5)))
+        } else {
+            HStack {
+                Label {
+                    Text("Clamshell mode")
+                } icon: {
+                    Image(systemName: "cup.and.saucer")
+                        .frame(width: 14, alignment: .center)
+                }
+                .font(.caption)
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { engine.clamshellModeEnabled },
+                    set: { newValue in
+                        if newValue && !engine.clamshellModeEnabled {
+                            confirmState.wrappedValue = true
+                        } else {
+                            engine.clamshellModeEnabled = newValue
+                        }
+                    }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+            }
         }
     }
 

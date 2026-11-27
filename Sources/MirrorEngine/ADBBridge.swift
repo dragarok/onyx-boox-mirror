@@ -11,6 +11,25 @@
 
 import Foundation
 
+/// A USB-connected Android device detected by ADB.
+public struct ConnectedDevice: Identifiable {
+    public var id: String { serial }
+    public let serial: String
+    public let model: String
+
+    /// Infer device family from the model string reported by ADB.
+    /// Currently identifies DC-1 by exclusion; everything else is `.other`.
+    /// Future: detect specific reflective displays and auto-configure resolution.
+    public var deviceFamily: DeviceFamily {
+        let m = model.lowercased()
+        if m.contains("dc-1") || m.contains("daylight") || m.contains("dc1") {
+            return .daylightDC1
+        }
+        // Default unknown devices to DC-1 for now (most users only have DC-1)
+        return .daylightDC1
+    }
+}
+
 struct ADBBridge {
     /// Resolved path to the adb binary. Prefers system adb (user-managed, up-to-date),
     /// falls back to bundled copy (for users without Homebrew/Android SDK).
@@ -82,12 +101,17 @@ struct ADBBridge {
 
     /// Create a Process configured to run adb with the given arguments.
     /// Uses the full shell environment to ensure we talk to the same adb server
-    /// as the user's terminal.
-    private static func makeADBProcess(_ arguments: [String]) -> Process? {
+    /// as the user's terminal. When serial is provided, prepends `-s <serial>`.
+    private static func makeADBProcess(_ arguments: [String], serial: String? = nil) -> Process? {
         guard let adbPath = resolvedADBPath else { return nil }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: adbPath)
-        process.arguments = arguments
+        var args: [String] = []
+        if let serial = serial {
+            args += ["-s", serial]
+        }
+        args += arguments
+        process.arguments = args
         process.environment = shellEnvironment
         return process
     }
@@ -120,46 +144,65 @@ struct ADBBridge {
         return false
     }
 
+    /// Returns the serial of the first connected device (legacy convenience).
     static func connectedDevice() -> String? {
+        return connectedDevices().first?.serial
+    }
+
+    /// Detect all connected USB devices. Parses `adb devices -l` for serial + model.
+    static func connectedDevices() -> [ConnectedDevice] {
         let stdout = Pipe()
         let stderr = Pipe()
-        guard let process = makeADBProcess(["devices"]) else {
-            NSLog("[ADB] connectedDevice: no adb binary")
-            return nil
+        guard let process = makeADBProcess(["devices", "-l"]) else {
+            NSLog("[ADB] connectedDevices: no adb binary")
+            return []
         }
         process.standardOutput = stdout
         process.standardError = stderr
         do {
             try process.run()
         } catch {
-            NSLog("[ADB] connectedDevice: failed to launch — %@", "\(error)")
-            return nil
+            NSLog("[ADB] connectedDevices: failed to launch — %@", "\(error)")
+            return []
         }
         process.waitUntilExit()
         let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let errOutput = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         if process.terminationStatus != 0 {
-            NSLog("[ADB] connectedDevice: exit %d — %@", process.terminationStatus, errOutput.trimmingCharacters(in: .whitespacesAndNewlines))
-            return nil
+            let errOutput = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            NSLog("[ADB] connectedDevices: exit %d — %@", process.terminationStatus, errOutput.trimmingCharacters(in: .whitespacesAndNewlines))
+            return []
         }
+
+        var devices: [ConnectedDevice] = []
         for line in output.split(separator: "\n").dropFirst() {
-            let parts = line.split(separator: "\t")
-            if parts.count >= 2 && parts[1] == "device" {
-                return String(parts[0])
+            // Format: "SERIAL  device usb:... product:... model:MODEL device:..."
+            let parts = line.split(separator: " ", maxSplits: 2)
+            guard parts.count >= 2 else { continue }
+            let serial = String(parts[0])
+            let status = String(parts[1])
+            guard status == "device" else {
+                NSLog("[ADB] connectedDevices: %@ status '%@' (not ready)", serial, status)
+                continue
             }
-            if parts.count >= 2 {
-                NSLog("[ADB] connectedDevice: device %@ status '%@' (not ready)", String(parts[0]), String(parts[1]))
+            // Extract model from key:value pairs
+            var model = "unknown"
+            if let modelRange = line.range(of: "model:") {
+                let afterModel = line[modelRange.upperBound...]
+                model = String(afterModel.prefix(while: { $0 != " " }))
             }
+            devices.append(ConnectedDevice(serial: serial, model: model))
+            NSLog("[ADB] connectedDevices: found %@ (model: %@)", serial, model)
         }
-        NSLog("[ADB] connectedDevice: no device found in output: %@", output.trimmingCharacters(in: .whitespacesAndNewlines))
-        return nil
+        return devices
     }
 
+    /// Set up ADB reverse tunnel: device's `devicePort` → Mac's `hostPort`.
+    /// Both Android apps connect to localhost:8888, but the tunnel routes each to its own Mac port.
     @discardableResult
-    static func setupReverseTunnel(port: UInt16) -> Bool {
+    static func setupReverseTunnel(serial: String? = nil, devicePort: UInt16 = TCP_PORT, hostPort: UInt16 = TCP_PORT) -> Bool {
         let stdout = Pipe()
         let stderr = Pipe()
-        guard let process = makeADBProcess(["reverse", "tcp:\(port)", "tcp:\(port)"]) else { return false }
+        guard let process = makeADBProcess(["reverse", "tcp:\(devicePort)", "tcp:\(hostPort)"], serial: serial) else { return false }
         process.standardOutput = stdout
         process.standardError = stderr
         do {
@@ -178,31 +221,31 @@ struct ADBBridge {
                   errOutput.trimmingCharacters(in: .whitespacesAndNewlines))
             return false
         }
-        NSLog("[ADB] setupReverseTunnel: success — stdout='%@'", stdOutput.trimmingCharacters(in: .whitespacesAndNewlines))
+        NSLog("[ADB] setupReverseTunnel: %@:%d → host:%d — success", serial ?? "default", devicePort, hostPort)
 
-        let verified = verifyReverseTunnel(port: port)
+        let verified = verifyReverseTunnel(serial: serial, devicePort: devicePort)
         if !verified {
             NSLog("[ADB] setupReverseTunnel: WARNING — command succeeded but tunnel not in --list!")
         }
         return verified
     }
 
-    private static func verifyReverseTunnel(port: UInt16) -> Bool {
+    private static func verifyReverseTunnel(serial: String? = nil, devicePort: UInt16 = TCP_PORT) -> Bool {
         let stdout = Pipe()
-        guard let process = makeADBProcess(["reverse", "--list"]) else { return false }
+        guard let process = makeADBProcess(["reverse", "--list"], serial: serial) else { return false }
         process.standardOutput = stdout
         process.standardError = FileHandle.nullDevice
         try? process.run()
         process.waitUntilExit()
         let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let found = output.contains("tcp:\(port)")
+        let found = output.contains("tcp:\(devicePort)")
         NSLog("[ADB] verifyReverseTunnel: %@ (output='%@')", found ? "VERIFIED" : "NOT FOUND", output.trimmingCharacters(in: .whitespacesAndNewlines))
         return found
     }
 
     @discardableResult
-    static func removeReverseTunnel(port: UInt16) -> Bool {
-        guard let process = makeADBProcess(["reverse", "--remove", "tcp:\(port)"]) else { return false }
+    static func removeReverseTunnel(serial: String? = nil, devicePort: UInt16 = TCP_PORT) -> Bool {
+        guard let process = makeADBProcess(["reverse", "--remove", "tcp:\(devicePort)"], serial: serial) else { return false }
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try? process.run()
@@ -210,9 +253,9 @@ struct ADBBridge {
         return process.terminationStatus == 0
     }
 
-    static func querySystemSetting(_ setting: String) -> Int? {
+    static func querySystemSetting(_ setting: String, serial: String? = nil) -> Int? {
         let pipe = Pipe()
-        guard let process = makeADBProcess(["shell", "settings", "get", "system", setting]) else { return nil }
+        guard let process = makeADBProcess(["shell", "settings", "get", "system", setting], serial: serial) else { return nil }
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         try? process.run()
@@ -224,50 +267,17 @@ struct ADBBridge {
         return nil
     }
 
-    static func setSystemSetting(_ setting: String, value: Int) {
-        guard let process = makeADBProcess(["shell", "settings", "put", "system", setting, "\(value)"]) else { return }
+    static func setSystemSetting(_ setting: String, value: Int, serial: String? = nil) {
+        guard let process = makeADBProcess(["shell", "settings", "put", "system", setting, "\(value)"], serial: serial) else { return }
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try? process.run()
     }
 
-    /// Run a raw shell command via `adb shell` using /bin/sh to handle redirects.
-    private static func runShellCommand(_ cmd: String) {
-        guard let adbPath = resolvedADBPath else {
-            NSLog("[ADB] runShellCommand: no adb binary")
-            return
-        }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", "\(adbPath) shell '\(cmd)'"]
-        process.environment = shellEnvironment
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-            if process.terminationStatus != 0 {
-                NSLog("[ADB] shell command failed (exit %d): %@", process.terminationStatus, cmd)
-            }
-        } catch {
-            NSLog("[ADB] runShellCommand error: %@", "\(error)")
-        }
-    }
-
-    /// Write a value to a sysfs file on the device via adb shell.
-    static func writeSysfs(_ path: String, value: Int) {
-        runShellCommand("echo \(value) > \(path)")
-    }
-
-    /// Trigger a full e-ink refresh via Onyx broadcast.
-    static func triggerEinkRefresh() {
-        runShellCommand("am broadcast -a android.onyx.action.FULL_REFRESH")
-    }
-
-    /// Check if the companion Android app is installed on the connected device.
-    static func isAppInstalled() -> Bool {
+    /// Check if the companion Android app is installed on the specified device.
+    static func isAppInstalled(serial: String? = nil) -> Bool {
         let pipe = Pipe()
-        guard let process = makeADBProcess(["shell", "pm", "list", "packages", "com.daylight.mirror"]) else { return false }
+        guard let process = makeADBProcess(["shell", "pm", "list", "packages", "com.daylight.mirror"], serial: serial) else { return false }
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         try? process.run()
@@ -276,9 +286,9 @@ struct ADBBridge {
         return output.contains("package:com.daylight.mirror")
     }
 
-    /// Install the bundled APK onto the connected device.
+    /// Install the bundled APK onto the specified device.
     /// Returns nil on success, or an error message on failure.
-    static func installBundledAPK() -> String? {
+    static func installBundledAPK(serial: String? = nil) -> String? {
         guard let resourcePath = Bundle.main.resourcePath else {
             return "No resource path in bundle"
         }
@@ -287,7 +297,7 @@ struct ADBBridge {
             return "No bundled APK found"
         }
         let pipe = Pipe()
-        guard let process = makeADBProcess(["install", "-r", apkPath]) else {
+        guard let process = makeADBProcess(["install", "-r", apkPath], serial: serial) else {
             return "ADB not available"
         }
         process.standardOutput = pipe
@@ -298,18 +308,46 @@ struct ADBBridge {
         if process.terminationStatus != 0 {
             return "Install failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))"
         }
-        NSLog("[ADB] Installed bundled APK successfully")
+        NSLog("[ADB] Installed bundled APK on %@", serial ?? "default")
         return nil
     }
 
-    /// Launch the companion app. When `forceRestart` is true, uses `-S` to stop any
-    /// existing instance first, ensuring a fresh TCP connection through the tunnel.
-    static func launchApp(forceRestart: Bool = false) {
+    /// Reset display size override so the app gets the full physical panel resolution.
+    /// The DC-1 ships with `display_size_forced=1184,1584` which steals 16px per axis,
+    /// causing 1600x1200 frames to be scaled to 1584x1184 — destroying 1:1 pixel mapping.
+    @discardableResult
+    static func resetDisplaySizeOverride(serial: String? = nil) -> Bool {
+        // Check current override
+        let checkPipe = Pipe()
+        guard let checkProcess = makeADBProcess(["shell", "wm", "size"], serial: serial) else { return false }
+        checkProcess.standardOutput = checkPipe
+        checkProcess.standardError = FileHandle.nullDevice
+        try? checkProcess.run()
+        checkProcess.waitUntilExit()
+        let sizeOutput = String(data: checkPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        if sizeOutput.contains("Override") {
+            // Reset size override to physical resolution
+            guard let resetProcess = makeADBProcess(["shell", "wm", "size", "reset"], serial: serial) else { return false }
+            resetProcess.standardOutput = FileHandle.nullDevice
+            resetProcess.standardError = FileHandle.nullDevice
+            try? resetProcess.run()
+            resetProcess.waitUntilExit()
+            NSLog("[ADB] Reset display size override (was: %@)", sizeOutput.trimmingCharacters(in: .whitespacesAndNewlines))
+            return resetProcess.terminationStatus == 0
+        }
+        NSLog("[ADB] No display size override to reset")
+        return true
+    }
+
+    /// Launch the companion app on the specified device.
+    /// When `forceRestart` is true, uses `-S` to stop any existing instance first.
+    static func launchApp(serial: String? = nil, forceRestart: Bool = false) {
         var args = ["shell", "am", "start"]
         if forceRestart { args.append("-S") }
         args += ["-n", "com.daylight.mirror/.MirrorActivity"]
         let stderr = Pipe()
-        guard let process = makeADBProcess(args) else { return }
+        guard let process = makeADBProcess(args, serial: serial) else { return }
         process.standardOutput = FileHandle.nullDevice
         process.standardError = stderr
         do {
@@ -323,7 +361,7 @@ struct ADBBridge {
             let errOutput = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             NSLog("[ADB] launchApp: exit %d — %@", process.terminationStatus, errOutput.trimmingCharacters(in: .whitespacesAndNewlines))
         } else {
-            NSLog("[ADB] Launched Daylight Mirror on device%@", forceRestart ? " (force-restart)" : "")
+            NSLog("[ADB] Launched Daylight Mirror on %@%@", serial ?? "default", forceRestart ? " (force-restart)" : "")
         }
     }
 }

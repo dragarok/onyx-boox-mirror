@@ -1,17 +1,17 @@
-// DisplayController.swift — Keyboard controls for display hardware.
+// DisplayController.swift — Keyboard controls for Daylight hardware.
 //
-// Intercepts Ctrl+function key events for display control:
+// Intercepts Ctrl+function key events for Daylight display control:
 //   Ctrl+F1/F2:   Brightness down/up
-//   Ctrl+F3/F4:   Warmth down/up
-//   Ctrl+F5:      Full e-ink refresh
 //   Ctrl+F10:     Toggle backlight on/off
+//   Ctrl+F11/F12: Warmth (amber) down/up
 
 import AppKit
 
 class DisplayController {
     let tcpServer: TCPServer
+    let deviceSerial: String?  // For targeted ADB commands
     var currentBrightness: Int = 128
-    var currentWarmth: Int = 0
+    var currentWarmth: Int = 128
     var backlightOn: Bool = true
     var savedBrightness: Int = 128
     var keyMonitor: Any?
@@ -21,32 +21,40 @@ class DisplayController {
     var onWarmthChanged: ((Int) -> Void)?
     var onBacklightChanged: ((Bool) -> Void)?
 
-    init(tcpServer: TCPServer) {
+    init(tcpServer: TCPServer, deviceSerial: String? = nil) {
         self.tcpServer = tcpServer
+        self.deviceSerial = deviceSerial
     }
 
     func start() {
-        // Query current brightness from device
+        // Query current values from device
         DispatchQueue.global().async { [weak self] in
             guard let self = self else { return }
-            if let val = ADBBridge.querySystemSetting("screen_brightness") {
+            if let val = ADBBridge.querySystemSetting("screen_brightness", serial: self.deviceSerial) {
                 self.currentBrightness = val
                 self.savedBrightness = val
+                // Sync to TCPServer so reconnecting clients get the correct value
+                self.tcpServer.sendCommand(CMD_BRIGHTNESS, value: UInt8(val))
                 self.onBrightnessChanged?(val)
-                print("[Display] Brightness: \(val)/255")
+                print("[Display] Daylight brightness: \(val)/255")
+            }
+            if let val = ADBBridge.querySystemSetting("screen_brightness_amber_rate", serial: self.deviceSerial) {
+                // Effective range is 0-255 (device accepts 0-1023 but caps effect at 255)
+                self.currentWarmth = min(val, 255)
+                self.onWarmthChanged?(self.currentWarmth)
+                print("[Display] Daylight warmth: \(self.currentWarmth)/255")
             }
         }
 
-        // NSEvent monitors for keyboard shortcuts
+        // NSEvent monitors for keyboard shortcuts (no TCC code-signing issues)
         keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.modifierFlags.contains(.control), let self = self else { return }
             switch event.keyCode {
             case 122: self.adjustBrightness(by: -BRIGHTNESS_STEP)  // Ctrl+F1
             case 120: self.adjustBrightness(by: BRIGHTNESS_STEP)   // Ctrl+F2
-            case 99:  self.adjustWarmth(by: -WARMTH_STEP)          // Ctrl+F3
-            case 118: self.adjustWarmth(by: WARMTH_STEP)           // Ctrl+F4
-            case 96:  self.refreshScreen()                         // Ctrl+F5
             case 109: self.toggleBacklight()                       // Ctrl+F10
+            case 103: self.adjustWarmth(by: -WARMTH_STEP)          // Ctrl+F11
+            case 111: self.adjustWarmth(by: WARMTH_STEP)           // Ctrl+F12
             default: break
             }
         }
@@ -60,15 +68,14 @@ class DisplayController {
             switch keyCode {
             case 3: self.adjustBrightness(by: -BRIGHTNESS_STEP)  // Ctrl+F1 media
             case 2: self.adjustBrightness(by: BRIGHTNESS_STEP)   // Ctrl+F2 media
-            case 20: self.adjustWarmth(by: -WARMTH_STEP)         // Ctrl+F3 media
-            case 19: self.adjustWarmth(by: WARMTH_STEP)          // Ctrl+F4 media
-            case 23: self.refreshScreen()                        // Ctrl+F5 media
             case 7: self.toggleBacklight()                       // Ctrl+F10 media
+            case 1: self.adjustWarmth(by: -WARMTH_STEP)          // Ctrl+F11 media
+            case 0: self.adjustWarmth(by: WARMTH_STEP)           // Ctrl+F12 media
             default: break
             }
         }
 
-        print("[Display] Ctrl+F1/F2: brightness | Ctrl+F3/F4: warmth | Ctrl+F5: refresh | Ctrl+F10: backlight")
+        print("[Display] Ctrl+F1/F2: brightness | Ctrl+F10: backlight toggle | Ctrl+F11/F12: warmth")
     }
 
     func stop() {
@@ -85,7 +92,7 @@ class DisplayController {
         currentBrightness = Self.brightnessFromSliderPos(newPos)
         savedBrightness = max(currentBrightness, 1)
         backlightOn = currentBrightness > 0
-        sendBrightness()
+        tcpServer.sendCommand(CMD_BRIGHTNESS, value: UInt8(currentBrightness))
         onBrightnessChanged?(currentBrightness)
         onBacklightChanged?(backlightOn)
         print("[Display] Brightness -> \(currentBrightness)/255")
@@ -95,7 +102,7 @@ class DisplayController {
         currentBrightness = max(0, min(255, value))
         savedBrightness = max(currentBrightness, 1)
         backlightOn = currentBrightness > 0
-        sendBrightness()
+        tcpServer.sendCommand(CMD_BRIGHTNESS, value: UInt8(currentBrightness))
         onBrightnessChanged?(currentBrightness)
         onBacklightChanged?(backlightOn)
     }
@@ -106,60 +113,42 @@ class DisplayController {
         MirrorEngine.brightnessFromSliderPos(pos)
     }
 
-    func toggleBacklight() {
-        if backlightOn {
-            savedBrightness = max(currentBrightness, 1)
-            currentBrightness = 0
-            backlightOn = false
-            sendBrightness()
-            onBrightnessChanged?(0)
-            onBacklightChanged?(false)
-            print("[Display] Backlight OFF")
-        } else {
-            currentBrightness = savedBrightness
-            backlightOn = true
-            sendBrightness()
-            onBrightnessChanged?(currentBrightness)
-            onBacklightChanged?(true)
-            print("[Display] Backlight ON -> \(currentBrightness)/255")
-        }
-    }
-
     func adjustWarmth(by delta: Int) {
         currentWarmth = max(0, min(255, currentWarmth + delta))
-        sendWarmth()
+        // Warmth goes via adb shell — screen_brightness_amber_rate is a Daylight-protected
+        // setting that only the shell user can write, not a regular Android app.
+        DispatchQueue.global().async { [warmth = currentWarmth, serial = deviceSerial] in
+            ADBBridge.setSystemSetting("screen_brightness_amber_rate", value: warmth, serial: serial)
+        }
         onWarmthChanged?(currentWarmth)
         print("[Display] Warmth -> \(currentWarmth)/255")
     }
 
     func setWarmth(_ value: Int) {
         currentWarmth = max(0, min(255, value))
-        sendWarmth()
+        DispatchQueue.global().async { [warmth = currentWarmth, serial = deviceSerial] in
+            ADBBridge.setSystemSetting("screen_brightness_amber_rate", value: warmth, serial: serial)
+        }
         onWarmthChanged?(currentWarmth)
+        print("[Display] Warmth -> \(currentWarmth)/255")
     }
 
-    func refreshScreen() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            ADBBridge.triggerEinkRefresh()
-        }
-        print("[Display] Full e-ink refresh")
-    }
-
-    // MARK: - ADB sysfs writes (Boox frontlight)
-
-    /// Send brightness via adb shell → sysfs. Rescales 0-255 to 0-25.
-    private func sendBrightness() {
-        let scaled = (currentBrightness * 25) / 255
-        DispatchQueue.global(qos: .userInitiated).async {
-            ADBBridge.writeSysfs("/sys/class/backlight/onyx_bl_br/brightness", value: scaled)
-        }
-    }
-
-    /// Send warmth via adb shell → sysfs. Rescales 0-255 to 0-24.
-    private func sendWarmth() {
-        let scaled = (currentWarmth * 24) / 255
-        DispatchQueue.global(qos: .userInitiated).async {
-            ADBBridge.writeSysfs("/sys/class/backlight/onyx_bl_ct/brightness", value: scaled)
+    func toggleBacklight() {
+        if backlightOn {
+            savedBrightness = max(currentBrightness, 1)
+            currentBrightness = 0
+            backlightOn = false
+            tcpServer.sendCommand(CMD_BRIGHTNESS, value: 0)
+            onBrightnessChanged?(0)
+            onBacklightChanged?(false)
+            print("[Display] Backlight OFF")
+        } else {
+            currentBrightness = savedBrightness
+            backlightOn = true
+            tcpServer.sendCommand(CMD_BRIGHTNESS, value: UInt8(currentBrightness))
+            onBrightnessChanged?(currentBrightness)
+            onBacklightChanged?(true)
+            print("[Display] Backlight ON -> \(currentBrightness)/255")
         }
     }
 }

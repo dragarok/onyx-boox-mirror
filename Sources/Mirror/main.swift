@@ -6,8 +6,11 @@
 //   daylight-mirror status             — Print current state (machine-readable key=value pairs)
 //   daylight-mirror reconnect          — Re-establish ADB tunnel and relaunch Android app
 //   daylight-mirror brightness [0-255] — Get or set Daylight brightness
+//   daylight-mirror warmth [0-255]     — Get or set Daylight warmth (amber rate)
 //   daylight-mirror backlight [on|off|toggle] — Get or toggle backlight
 //   daylight-mirror resolution [preset] — Get or set resolution (incl. portrait variants)
+//   daylight-mirror clamshell [on|off] — Get or set clamshell mode (lid-closed operation)
+//   daylight-mirror health             — Full engine health status dump
 //   daylight-mirror restart            — Full stop + start cycle
 //
 // The engine (whether started by this CLI or the GUI menu bar app) exposes a
@@ -379,6 +382,20 @@ func commandBrightness() {
     }
 }
 
+/// `daylight-mirror warmth [value]` — get or set Daylight warmth/amber rate (0-255).
+func commandWarmth() {
+    let arg = args.count > 2 ? args[2] : nil
+    if let arg = arg {
+        guard let value = Int(arg), (0...255).contains(value) else {
+            print("ERROR: warmth value must be 0-255")
+            exit(1)
+        }
+        runControlCommand("WARMTH \(value)")
+    } else {
+        runControlCommand("WARMTH")
+    }
+}
+
 /// `daylight-mirror backlight [on|off|toggle]` — get or toggle backlight state.
 func commandBacklight() {
     let arg = args.count > 2 ? args[2].lowercased() : nil
@@ -409,6 +426,26 @@ func commandRestart() {
     runControlCommand("RESTART")
 }
 
+/// `daylight-mirror sharpen [0.0-3.0]` — get or set sharpening amount.
+func commandSharpen() {
+    let arg = args.count > 2 ? args[2] : nil
+    if let arg = arg {
+        runControlCommand("SHARPEN \(arg)")
+    } else {
+        runControlCommand("SHARPEN")
+    }
+}
+
+/// `daylight-mirror contrast [1.0-2.0]` — get or set contrast enhancement.
+func commandContrast() {
+    let arg = args.count > 2 ? args[2] : nil
+    if let arg = arg {
+        runControlCommand("CONTRAST \(arg)")
+    } else {
+        runControlCommand("CONTRAST")
+    }
+}
+
 /// `daylight-mirror fontsmoothing [on|off]` — get or set macOS font smoothing.
 func commandFontSmoothing() {
     let arg = args.count > 2 ? args[2].lowercased() : nil
@@ -419,17 +456,55 @@ func commandFontSmoothing() {
     }
 }
 
-/// `daylight-mirror color [on|off]` — get or set color mode (default: greyscale).
-func commandColor() {
+/// `daylight-mirror clamshell [on|off]` — get or set clamshell mode (prevent sleep on lid close).
+func commandClamshell() {
     let arg = args.count > 2 ? args[2].lowercased() : nil
     if let arg = arg {
-        guard ["on", "off"].contains(arg) else {
-            print("ERROR: color argument must be on or off")
+        guard ["on", "off", "enable", "disable"].contains(arg) else {
+            print("ERROR: clamshell argument must be on or off")
             exit(1)
         }
-        runControlCommand("COLOR \(arg)")
+        runControlCommand("CLAMSHELL \(arg)")
     } else {
-        runControlCommand("COLOR")
+        runControlCommand("CLAMSHELL")
+    }
+}
+
+/// `daylight-mirror health [verbose]` — print full engine health status.
+/// With `verbose`, includes system-level diagnostics (memory, IOKit state, per-session details).
+func commandHealth() {
+    let verbose = args.count > 2 && args[2].lowercased() == "verbose"
+    guard controlSocketExists() else {
+        print("ERROR: Daylight Mirror is not running.")
+        exit(1)
+    }
+    let cmd = verbose ? "HEALTH verbose" : "HEALTH"
+    guard let response = sendControlCommand(cmd) else {
+        print("ERROR: Could not connect to control socket.")
+        exit(1)
+    }
+    if response.hasPrefix("ERR") {
+        print(response)
+        exit(1)
+    }
+    let lines = response.split(separator: "\n").dropFirst()
+    print("Daylight Mirror — Health\(verbose ? " (verbose)" : "")")
+    print("========================")
+    var section = ""
+    for line in lines {
+        let lineStr = String(line)
+        if lineStr.hasPrefix("---") && lineStr.hasSuffix("---") {
+            section = lineStr.replacingOccurrences(of: "-", with: "")
+            print("")
+            print("  [\(section)]")
+            continue
+        }
+        let kv = lineStr.split(separator: "=", maxSplits: 1)
+        if kv.count == 2 {
+            let key = String(kv[0]).replacingOccurrences(of: "_", with: " ")
+            let val = String(kv[1])
+            print("  \(key.padding(toLength: 28, withPad: " ", startingAt: 0)) \(val)")
+        }
     }
 }
 
@@ -470,19 +545,19 @@ func commandLatency() {
         if watch {
             print("\u{1B}[2J\u{1B}[H", terminator: "")
         }
-        print("Mirror — Latency Diagnostics")
-        print("============================")
+        print("Daylight Mirror — Latency Diagnostics")
+        print("======================================")
         print("FPS:              \(fps)")
         print("Clients:          \(clients)")
         print("Total frames:     \(frames)")
         print("Skipped frames:   \(skipped)")
         print("")
         print("Mac processing:")
-        print("  RGB convert:    \(grey) ms")
+        print("  Greyscale:      \(grey) ms")
         print("  LZ4 compress:   \(compress) ms")
         print("  Jitter:         \(jitter) ms")
         print("")
-        print("Round-trip (Mac → Device → Mac):")
+        print("Round-trip (Mac → Daylight → Mac):")
         print("  Average:        \(rttAvg) ms")
         print("  P95:            \(rttP95) ms")
         print("")
@@ -491,7 +566,7 @@ func commandLatency() {
                 print("Est. one-way:     ~\(String(format: "%.1f", avg / 2.0)) ms")
             }
         } else {
-            print("(Waiting for ACKs from device — is the Android app updated?)")
+            print("(Waiting for ACKs from Daylight — is the Android app updated?)")
         }
     }
 
@@ -519,12 +594,16 @@ func printUsage() {
     print("  stop                     Stop the running mirror instance")
     print("  status                   Print current state (machine-readable key=value pairs)")
     print("  reconnect                Re-establish ADB reverse tunnel and relaunch Android app")
-    print("  brightness [0-255]       Get or set brightness")
+    print("  brightness [0-255]       Get or set Daylight brightness")
+    print("  warmth [0-255]           Get or set Daylight warmth (amber rate)")
     print("  backlight [on|off|toggle] Get or toggle backlight")
-    print("  resolution [preset]      Get or set resolution (cozy, balanced, sharp,")
+    print("  resolution [preset]      Get or set resolution (cozy, comfortable, balanced, sharp,")
     print("                             portrait-cozy, portrait-balanced, portrait-sharp)")
-    print("  color [on|off]           Get or set color mode (default: greyscale, 3x smaller)")
+    print("  sharpen [0.0-3.0]        Get or set sharpening (0=none, 1=mild, 2=strong)")
+    print("  contrast [1.0-2.0]       Get or set contrast (1.0=off, 1.5=moderate, 2.0=high)")
     print("  fontsmoothing [on|off]   Get or set macOS font smoothing (off = crisper text)")
+    print("  clamshell [on|off]       Get or set clamshell mode (prevent sleep on lid close)")
+    print("  health [verbose]         Print engine health (verbose adds memory, IOKit, sessions)")
     print("  latency                  Print latency diagnostics (RTT, jitter, processing times)")
     print("  latency --watch          Continuously poll latency stats every 2 seconds")
     print("  restart                  Full stop + start cycle")
@@ -549,16 +628,24 @@ case "reconnect":
     commandReconnect()
 case "brightness":
     commandBrightness()
+case "warmth":
+    commandWarmth()
 case "backlight":
     commandBacklight()
 case "resolution":
     commandResolution()
 case "restart":
     commandRestart()
+case "sharpen":
+    commandSharpen()
+case "contrast":
+    commandContrast()
 case "fontsmoothing":
     commandFontSmoothing()
-case "color":
-    commandColor()
+case "clamshell":
+    commandClamshell()
+case "health":
+    commandHealth()
 case "latency":
     commandLatency()
 case "-h", "--help", "help":

@@ -92,6 +92,13 @@ final class ConfigurationTests: XCTestCase {
         }
     }
 
+    // MARK: - Display mode
+
+    func testDisplayModeRawValues() {
+        XCTAssertEqual(DisplayMode(rawValue: "mirror"), .mirror)
+        XCTAssertEqual(DisplayMode(rawValue: "extended"), .extended)
+    }
+
     // MARK: - Backpressure formula
 
     func testBackpressureAtLowRTT() {

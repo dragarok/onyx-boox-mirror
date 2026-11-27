@@ -5,6 +5,7 @@
 // whichever process owns the engine (GUI app or CLI daemon).
 
 import Foundation
+import IOKit
 
 public class ControlSocket {
     public static let socketPath = "/tmp/daylight-mirror.sock"
@@ -90,6 +91,32 @@ public class ControlSocket {
         }
     }
 
+    /// Query IOKit for clamshell-related power management state.
+    private static func iokitClamshellState() -> [(String, String)] {
+        var result: [(String, String)] = []
+        let service = IOServiceGetMatchingService(kIOMainPortDefault,
+            IOServiceMatching("IOPMrootDomain"))
+        guard service != IO_OBJECT_NULL else { return result }
+        defer { IOObjectRelease(service) }
+        if let val = IORegistryEntryCreateCFProperty(service,
+            "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() {
+            result.append(("clamshell_state", "\(val)"))
+        }
+        if let val = IORegistryEntryCreateCFProperty(service,
+            "AppleClamshellCausesSleep" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() {
+            result.append(("clamshell_causes_sleep", "\(val)"))
+        }
+        if let val = IORegistryEntryCreateCFProperty(service,
+            "SleepDisabled" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() {
+            result.append(("sleep_disabled", "\(val)"))
+        }
+        if let val = IORegistryEntryCreateCFProperty(service,
+            "ExternalConnected" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() {
+            result.append(("external_connected", "\(val)"))
+        }
+        return result
+    }
+
     /// Parse and execute a control command. Returns the response string.
     private func handleCommand(_ raw: String) -> String {
         let parts = raw.split(separator: " ", maxSplits: 1).map(String.init)
@@ -104,6 +131,15 @@ public class ControlSocket {
                 return "OK \(clamped)"
             } else {
                 return "OK \(engine.brightness)"
+            }
+
+        case "WARMTH":
+            if let arg = arg, let value = Int(arg) {
+                let clamped = max(0, min(255, value))
+                engine.setWarmth(clamped)
+                return "OK \(clamped)"
+            } else {
+                return "OK \(engine.warmth)"
             }
 
         case "BACKLIGHT":
@@ -199,6 +235,50 @@ public class ControlSocket {
                 return "ERR not running"
             }
 
+        case "SHARPEN":
+            if let arg = parts.dropFirst().first {
+                guard let val = Double(arg), val >= 0, val <= 3.0 else {
+                    return "ERR value must be 0.0-3.0 (0=none, 1=mild, 2=strong)"
+                }
+                engine.sharpenAmount = val
+                return "OK \(String(format: "%.1f", val))"
+            } else {
+                return "OK \(String(format: "%.1f", engine.sharpenAmount))"
+            }
+
+        case "CONTRAST":
+            if let arg = parts.dropFirst().first {
+                guard let val = Double(arg), val >= 1.0, val <= 2.0 else {
+                    return "ERR value must be 1.0-2.0 (1.0=off, 1.5=moderate, 2.0=high)"
+                }
+                engine.contrastAmount = val
+                return "OK \(String(format: "%.1f", val))"
+            } else {
+                return "OK \(String(format: "%.1f", engine.contrastAmount))"
+            }
+
+        case "DISPLAYMODE":
+            if let arg = arg?.lowercased() {
+                guard let mode = DisplayMode(rawValue: arg) else {
+                    return "ERR unknown mode (valid: mirror, extended)"
+                }
+                if mode == engine.displayMode {
+                    return "OK \(mode.rawValue) (no change)"
+                }
+                engine.displayMode = mode
+                // Auto-restart if running, since display mode changes how the virtual display is configured
+                if engine.status == .running {
+                    engine.stop()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        Task { @MainActor in await self.engine.start() }
+                    }
+                    return "OK \(mode.rawValue) (restarting)"
+                }
+                return "OK \(mode.rawValue)"
+            } else {
+                return "OK \(engine.displayMode.rawValue)"
+            }
+
         case "FONTSMOOTHING":
             if let arg = parts.dropFirst().first?.lowercased() {
                 switch arg {
@@ -217,22 +297,6 @@ public class ControlSocket {
                 return "OK \(engine.fontSmoothingDisabled ? "off" : "on")"
             }
 
-        case "COLOR":
-            if let arg = arg?.lowercased() {
-                switch arg {
-                case "on":
-                    engine.setColorMode(true)
-                    return "OK on"
-                case "off":
-                    engine.setColorMode(false)
-                    return "OK off"
-                default:
-                    return "ERR use on or off"
-                }
-            } else {
-                return "OK \(engine.useColor ? "on" : "off")"
-            }
-
         case "LATENCY":
             guard engine.status == .running else {
                 return "ERR not running"
@@ -248,6 +312,113 @@ public class ControlSocket {
                 "total_frames=\(engine.totalFrames)",
                 "skipped_frames=\(engine.skippedFrames)"
             ]
+            return "OK\n" + lines.joined(separator: "\n")
+
+        case "CLAMSHELL":
+            if let arg = parts.dropFirst().first?.lowercased() {
+                switch arg {
+                case "on", "enable":
+                    engine.clamshellModeEnabled = true
+                    return "OK on"
+                case "off", "disable":
+                    engine.clamshellModeEnabled = false
+                    return "OK off"
+                default:
+                    return "ERR use on or off"
+                }
+            } else {
+                return "OK \(engine.clamshellModeEnabled ? "on" : "off")"
+            }
+
+        case "HEALTH":
+            let verbose = arg?.lowercased() == "verbose"
+            let s: String
+            switch engine.status {
+            case .idle: s = "idle"
+            case .waitingForDevice: s = "waiting_for_device"
+            case .starting: s = "starting"
+            case .running: s = "running"
+            case .stopping: s = "stopping"
+            case .error(let msg): s = "error: \(msg)"
+            }
+            var lines = [
+                "status=\(s)",
+                "version=\(MirrorEngine.appVersion)",
+                "resolution=\(engine.resolution.label)",
+                "display_mode=\(engine.displayMode.rawValue)",
+                "profile=\(engine.displayProfile.rawValue)",
+                "sharpen=\(String(format: "%.1f", engine.sharpenAmount))",
+                "contrast=\(String(format: "%.1f", engine.contrastAmount))",
+                "gamma=\(String(format: "%.1f", engine.gammaAmount))",
+                "fps=\(String(format: "%.1f", engine.fps))",
+                "clients=\(engine.clientCount)",
+                "total_frames=\(engine.totalFrames)",
+                "skipped_frames=\(engine.skippedFrames)",
+                "frame_size_kb=\(engine.frameSizeKB)",
+                "bandwidth_mbps=\(String(format: "%.2f", engine.bandwidth))",
+                "grey_ms=\(String(format: "%.1f", engine.greyMs))",
+                "compress_ms=\(String(format: "%.1f", engine.compressMs))",
+                "jitter_ms=\(String(format: "%.1f", engine.jitterMs))",
+                "rtt_avg_ms=\(String(format: "%.1f", engine.rttMs))",
+                "rtt_p95_ms=\(String(format: "%.1f", engine.rttP95Ms))",
+                "brightness=\(engine.brightness)",
+                "warmth=\(engine.warmth)",
+                "backlight=\(engine.backlightOn ? "on" : "off")",
+                "clamshell=\(engine.clamshellModeEnabled ? "on" : "off")",
+                "auto_mirror=\(engine.autoMirrorEnabled ? "on" : "off")",
+                "auto_dim=\(engine.autoDimMac ? "on" : "off")",
+                "font_smoothing=\(engine.fontSmoothingDisabled ? "off" : "on")",
+                "adb=\(engine.adbConnected ? "connected" : "disconnected")",
+                "sessions=\(engine.sessions.count)",
+                "device_detected=\(engine.deviceDetected ? "yes" : "no")"
+            ]
+            if verbose {
+                lines.append("---system---")
+                // Process memory
+                var info = mach_task_basic_info()
+                var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+                let kr = withUnsafeMutablePointer(to: &info) { infoPtr in
+                    infoPtr.withMemoryRebound(to: Int32.self, capacity: Int(count)) { rawPtr in
+                        task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), rawPtr, &count)
+                    }
+                }
+                if kr == KERN_SUCCESS {
+                    let rss = Double(info.resident_size) / 1024 / 1024
+                    let virt = Double(info.virtual_size) / 1024 / 1024
+                    lines.append("memory_rss_mb=\(String(format: "%.1f", rss))")
+                    lines.append("memory_virtual_mb=\(String(format: "%.0f", virt))")
+                }
+                // Uptime
+                let uptime = ProcessInfo.processInfo.systemUptime
+                let hours = Int(uptime) / 3600
+                let mins = (Int(uptime) % 3600) / 60
+                lines.append("process_uptime=\(hours)h\(mins)m")
+                // Per-session details
+                for (i, session) in engine.sessions.enumerated() {
+                    let vd = session.displayManager
+                    lines.append("session[\(i)].device=\(session.device.model)")
+                    lines.append("session[\(i)].serial=\(session.device.serial)")
+                    lines.append("session[\(i)].port=\(session.port)")
+                    lines.append("session[\(i)].resolution=\(session.resolution.label)")
+                    lines.append("session[\(i)].display_id=\(vd?.displayID ?? 0)")
+                    lines.append("session[\(i)].fps=\(String(format: "%.1f", session.fps))")
+                    lines.append("session[\(i)].clients=\(session.clientCount)")
+                    lines.append("session[\(i)].adb=\(session.adbConnected ? "yes" : "no")")
+                    lines.append("session[\(i)].capture_active=\(session.capture != nil ? "yes" : "no")")
+                    lines.append("session[\(i)].input_server=\(session.inputServer?.running == true ? "running" : "stopped")")
+                    if let cap = session.capture {
+                        lines.append("session[\(i)].capture_frames=\(cap.frameCount)")
+                        lines.append("session[\(i)].capture_skipped=\(cap.skippedFrames)")
+                        lines.append("session[\(i)].capture_stream=\(cap.displayStream != nil ? "alive" : "dead")")
+                    }
+                }
+                // Clamshell internals
+                lines.append("caffeinate_pid=\(engine.caffeinateProcess?.processIdentifier ?? 0)")
+                lines.append("caffeinate_running=\(engine.caffeinateProcess?.isRunning == true ? "yes" : "no")")
+                // IOKit clamshell state
+                let ioOutput = Self.iokitClamshellState()
+                for (k, v) in ioOutput { lines.append("iokit.\(k)=\(v)") }
+            }
             return "OK\n" + lines.joined(separator: "\n")
 
         default:

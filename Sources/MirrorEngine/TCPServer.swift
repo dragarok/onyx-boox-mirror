@@ -1,8 +1,8 @@
 // TCPServer.swift — Native TCP frame server for Daylight Mirror.
 //
-// Sends LZ4-compressed RGB frames to connected Android clients over raw TCP.
+// Sends LZ4-compressed greyscale frames to connected Android clients over raw TCP.
 // Protocol: [DA 7E] [flags] [len:4 LE] [payload]. Keyframes are full LZ4, deltas
-// are XOR + LZ4. Also sends resolution and brightness commands.
+// are XOR + LZ4. Also sends resolution and brightness/warmth commands.
 
 import Foundation
 import Network
@@ -26,15 +26,24 @@ class TCPServer {
     var lastKeyframeData: Data?
     var onClientCountChanged: ((Int) -> Void)?
     var onLatencyStats: ((LatencyStats) -> Void)?
-    var onTouchEvent: ((UInt8, UInt16, UInt16, Int16) -> Void)?
     private(set) var latencyStats: LatencyStats?
-    var isColorMode: Bool = false
     var frameWidth: UInt16 = 1024 {
-        didSet { lock.lock(); lastKeyframeData = nil; lock.unlock() }
+        didSet {
+            lock.lock(); lastKeyframeData = nil; lock.unlock()
+            if oldValue != frameWidth { broadcastResolution() }
+        }
     }
     var frameHeight: UInt16 = 768 {
-        didSet { lock.lock(); lastKeyframeData = nil; lock.unlock() }
+        didSet {
+            lock.lock(); lastKeyframeData = nil; lock.unlock()
+            if oldValue != frameHeight { broadcastResolution() }
+        }
     }
+
+    // Last-sent display state — re-sent to new clients on connect so
+    // brightness/warmth don't reset to defaults after a reconnect.
+    private var lastBrightness: UInt8 = 128
+    private var lastWarmth: UInt8 = 128
 
     private var sendTimestamps: [UInt32: Double] = [:]
     private let rttLock = NSLock()
@@ -62,7 +71,7 @@ class TCPServer {
     func start() {
         listener.stateUpdateHandler = { state in
             if case .ready = state {
-                print("TCP server on tcp://localhost:\(TCP_PORT)")
+                print("TCP server on tcp://localhost:\(self.listener.port?.rawValue ?? 0)")
             }
         }
 
@@ -83,9 +92,9 @@ class TCPServer {
                     self.rttLock.unlock()
                     self.onClientCountChanged?(count)
 
-                    // Tell client our frame dimensions and color mode before sending any frames
+                    // Tell client our frame dimensions and display state before sending frames
                     self.sendResolution(to: conn)
-                    self.sendColorMode(to: conn)
+                    self.sendDisplayState(to: conn)
 
                     if let kf = cachedKeyframe {
                         conn.send(content: kf, completion: .contentProcessed { _ in })
@@ -137,106 +146,70 @@ class TCPServer {
 
         var scanned = 0
         while ackParseBuffer.count >= 6 {
-            let base = ackParseBuffer.startIndex
-            guard ackParseBuffer[base] == 0xDA else {
+            guard ackParseBuffer[ackParseBuffer.startIndex] == MAGIC_ACK[0]
+                    && ackParseBuffer[ackParseBuffer.index(ackParseBuffer.startIndex, offsetBy: 1)] == MAGIC_ACK[1] else {
                 ackParseBuffer.removeFirst()
                 scanned += 1
-                if scanned > 256 { ackParseBuffer.removeAll(); return }
+                if scanned > 256 {
+                    ackParseBuffer.removeAll()
+                    return
+                }
                 continue
             }
 
-            let type = ackParseBuffer[ackParseBuffer.index(base, offsetBy: 1)]
+            let base = ackParseBuffer.startIndex
+            let b0 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 2)])
+            let b1 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 3)]) << 8
+            let b2 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 4)]) << 16
+            let b3 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 5)]) << 24
+            let seq = b0 | b1 | b2 | b3
+            ackParseBuffer.removeFirst(6)
 
-            if type == MAGIC_ACK[1] {
-                // ACK packet: [DA 7A] [seq:4 LE] = 6 bytes
-                let b0 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 2)])
-                let b1 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 3)]) << 8
-                let b2 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 4)]) << 16
-                let b3 = UInt32(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 5)]) << 24
-                let seq = b0 | b1 | b2 | b3
-                ackParseBuffer.removeFirst(6)
-                scanned = 0
+            let now = CACurrentMediaTime()
 
-                let now = CACurrentMediaTime()
-
-                guard let sendTime = sendTimestamps.removeValue(forKey: seq) else {
-                    continue
-                }
-                _inflightFrames -= 1
-                if _inflightFrames < 0 { _inflightFrames = 0 }
-                let rtt = (now - sendTime) * 1000.0
-                rttSamples.append(rtt)
-                if rttSamples.count > rttWindowSize {
-                    rttSamples.removeFirst(rttSamples.count - rttWindowSize)
-                }
-                totalAcks += 1
-
-                let sorted = rttSamples.sorted()
-                let avg = sorted.reduce(0, +) / Double(sorted.count)
-                let p95Index = min(Int(Double(sorted.count) * 0.95), sorted.count - 1)
-
-                let elapsed = now - lastAckStatsTime
-                let rate = elapsed > 0 ? Double(totalAcks) / elapsed : 0
-
-                let stats = LatencyStats(
-                    rttMs: rtt,
-                    rttMinMs: sorted.first ?? 0,
-                    rttMaxMs: sorted.last ?? 0,
-                    rttAvgMs: avg,
-                    rttP95Ms: sorted[p95Index],
-                    acksReceived: totalAcks,
-                    ackRate: rate
-                )
-
-                if totalAcks % 30 == 0 {
-                    print(String(format: "[RTT] last: %.1fms | avg: %.1fms | p95: %.1fms | min: %.1fms | max: %.1fms | acks: %d",
-                                 stats.rttMs, stats.rttAvgMs, stats.rttP95Ms, stats.rttMinMs, stats.rttMaxMs, stats.acksReceived))
-                }
-
-                latencyStats = stats
-                onLatencyStats?(stats)
-
-            } else if type == MAGIC_TOUCH[1] {
-                // Touch: [DA 7B] [action:1] [xNorm:2 LE] [yNorm:2 LE] = 7 bytes
-                // Scroll: [DA 7B] [3] [xNorm:2 LE] [yNorm:2 LE] [deltaY:2 LE] = 9 bytes
-                guard ackParseBuffer.count >= 7 else { break }
-                let action = ackParseBuffer[ackParseBuffer.index(base, offsetBy: 2)]
-
-                if action == 3 {
-                    // Scroll needs 9 bytes
-                    guard ackParseBuffer.count >= 9 else { break }
-                    let xNorm = UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 3)])
-                           | UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 4)]) << 8
-                    let yNorm = UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 5)])
-                           | UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 6)]) << 8
-                    let deltaY = Int16(bitPattern:
-                        UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 7)])
-                      | UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 8)]) << 8)
-                    ackParseBuffer.removeFirst(9)
-                    scanned = 0
-                    onTouchEvent?(action, xNorm, yNorm, deltaY)
-                } else {
-                    let xNorm = UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 3)])
-                           | UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 4)]) << 8
-                    let yNorm = UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 5)])
-                           | UInt16(ackParseBuffer[ackParseBuffer.index(base, offsetBy: 6)]) << 8
-                    ackParseBuffer.removeFirst(7)
-                    scanned = 0
-                    onTouchEvent?(action, xNorm, yNorm, 0)
-                }
-
-            } else {
-                ackParseBuffer.removeFirst()
-                scanned += 1
-                if scanned > 256 { ackParseBuffer.removeAll(); return }
+            guard let sendTime = sendTimestamps.removeValue(forKey: seq) else {
+                continue
             }
+            _inflightFrames -= 1
+            if _inflightFrames < 0 { _inflightFrames = 0 }
+            let rtt = (now - sendTime) * 1000.0
+            rttSamples.append(rtt)
+            if rttSamples.count > rttWindowSize {
+                rttSamples.removeFirst(rttSamples.count - rttWindowSize)
+            }
+            totalAcks += 1
+
+            let sorted = rttSamples.sorted()
+            let avg = sorted.reduce(0, +) / Double(sorted.count)
+            let p95Index = min(Int(Double(sorted.count) * 0.95), sorted.count - 1)
+
+            let elapsed = now - lastAckStatsTime
+            let rate = elapsed > 0 ? Double(totalAcks) / elapsed : 0
+
+            let stats = LatencyStats(
+                rttMs: rtt,
+                rttMinMs: sorted.first ?? 0,
+                rttMaxMs: sorted.last ?? 0,
+                rttAvgMs: avg,
+                rttP95Ms: sorted[p95Index],
+                acksReceived: totalAcks,
+                ackRate: rate
+            )
+
+            if totalAcks % 30 == 0 {
+                print(String(format: "[RTT] last: %.1fms | avg: %.1fms | p95: %.1fms | min: %.1fms | max: %.1fms | acks: %d",
+                             stats.rttMs, stats.rttAvgMs, stats.rttP95Ms, stats.rttMinMs, stats.rttMaxMs, stats.acksReceived))
+            }
+
+            latencyStats = stats
+            onLatencyStats?(stats)
         }
     }
 
-    func broadcast(payload: Data, isKeyframe: Bool, sequenceNumber: UInt32 = 0, flags: UInt8? = nil) {
+    func broadcast(payload: Data, isKeyframe: Bool, sequenceNumber: UInt32 = 0) {
         var header = Data(capacity: FRAME_HEADER_SIZE)
         header.append(contentsOf: MAGIC_FRAME)
-        header.append(flags ?? (isKeyframe ? FLAG_KEYFRAME : 0))
+        header.append(isKeyframe ? FLAG_KEYFRAME : 0)
         var seq = sequenceNumber.littleEndian
         header.append(Data(bytes: &seq, count: 4))
         var len = UInt32(payload.count).littleEndian
@@ -271,6 +244,10 @@ class TCPServer {
     }
 
     func sendCommand(_ cmd: UInt8, value: UInt8) {
+        // Track state so we can re-send on client reconnect
+        if cmd == CMD_BRIGHTNESS { lastBrightness = value }
+        if cmd == CMD_WARMTH { lastWarmth = value }
+
         var packet = Data(capacity: 4)
         packet.append(contentsOf: MAGIC_CMD)
         packet.append(cmd)
@@ -285,6 +262,27 @@ class TCPServer {
         }
     }
 
+    /// Broadcast resolution to all connected clients (called when frameWidth/frameHeight change)
+    func broadcastResolution() {
+        lock.lock()
+        let conns = connections
+        lock.unlock()
+        for conn in conns {
+            sendResolution(to: conn)
+        }
+    }
+
+    /// Re-send current brightness/warmth to a specific client on (re)connect
+    /// so the Daylight doesn't revert to defaults.
+    func sendDisplayState(to conn: NWConnection) {
+        var bPkt = Data(capacity: 4)
+        bPkt.append(contentsOf: MAGIC_CMD)
+        bPkt.append(CMD_BRIGHTNESS)
+        bPkt.append(lastBrightness)
+        conn.send(content: bPkt, completion: .contentProcessed { _ in })
+        print("[TCP] Sent brightness: \(self.lastBrightness)")
+    }
+
     /// Send resolution command to a specific client: [DA 7F] [04] [w:2 LE] [h:2 LE]
     func sendResolution(to conn: NWConnection) {
         var packet = Data(capacity: 7)
@@ -296,39 +294,5 @@ class TCPServer {
         packet.append(Data(bytes: &h, count: 2))
         conn.send(content: packet, completion: .contentProcessed { _ in })
         print("[TCP] Sent resolution: \(self.frameWidth)x\(self.frameHeight)")
-    }
-
-    /// Send color mode command to a specific client: [DA 7F] [05] [mode]
-    func sendColorMode(to conn: NWConnection) {
-        var packet = Data(capacity: 4)
-        packet.append(contentsOf: MAGIC_CMD)
-        packet.append(CMD_COLOR_MODE)
-        packet.append(isColorMode ? 1 : 0)
-        conn.send(content: packet, completion: .contentProcessed { _ in })
-    }
-
-    /// Broadcast color mode to all connected clients.
-    func sendColorMode() {
-        lock.lock()
-        let conns = connections
-        lock.unlock()
-        for conn in conns {
-            sendColorMode(to: conn)
-        }
-        print("[TCP] Sent color mode: \(isColorMode ? "color" : "greyscale")")
-    }
-
-    /// Send refresh command (no value byte): [DA 7F] [06]
-    func sendRefresh() {
-        var packet = Data(capacity: 3)
-        packet.append(contentsOf: MAGIC_CMD)
-        packet.append(CMD_REFRESH)
-
-        lock.lock()
-        let conns = connections
-        lock.unlock()
-        for conn in conns {
-            conn.send(content: packet, completion: .contentProcessed { _ in })
-        }
     }
 }
