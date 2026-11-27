@@ -74,6 +74,94 @@ enum NetworkAccess {
         return result
     }
 
+    /// Tailscale addresses (IPv4 in 100.64.0.0/10) on interfaces that also carry Tailscale's
+    /// IPv6 prefix fd7a:115c:a1e0::/48, so other VPNs using the CGNAT range are left out.
+    /// More than one when the Mac is signed in to several tailnets.
+    static func tailnetAddresses() -> [String] {
+        var v4: [String: [String]] = [:]
+        var tailscaleInterfaces = Set<String>()
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return [] }
+        defer { freeifaddrs(ifaddr) }
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let ifa = ptr.pointee
+            guard let sa = ifa.ifa_addr, Int32(ifa.ifa_flags) & IFF_UP != 0 else { continue }
+            let family = Int32(sa.pointee.sa_family)
+            guard family == AF_INET || family == AF_INET6 else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let ip = String(cString: host)
+            let name = String(cString: ifa.ifa_name)
+            if family == AF_INET6, ip.lowercased().hasPrefix("fd7a:115c:a1e0:") { tailscaleInterfaces.insert(name) }
+            if family == AF_INET, isTailnetIPv4(ip) { v4[name, default: []].append(ip) }
+        }
+        return v4.filter { tailscaleInterfaces.contains($0.key) }
+            .sorted { $0.key < $1.key }
+            .flatMap { $0.value }
+    }
+
+    /// 100.64.0.0/10 — the shared address space Tailscale assigns from.
+    static func isTailnetIPv4(_ ip: String) -> Bool {
+        let parts = ip.split(separator: ".").compactMap { UInt8($0) }
+        guard parts.count == 4 else { return false }
+        return parts[0] == 100 && (parts[1] & 0xC0) == 64
+    }
+
+    /// UserDefaults key: the Mac's own Tailscale addresses tablets may use. When the Mac is
+    /// in several tailnets (say personal and work), only these are offered and accepted.
+    /// Unset = every tailnet. Set with:
+    ///   defaults write com.daylight.mirror tailscaleAddresses -array 100.x.y.z
+    static let allowedTailnetKey = "tailscaleAddresses"
+
+    static var tailnetAllowlist: Set<String>? {
+        guard let list = UserDefaults.standard.stringArray(forKey: allowedTailnetKey), !list.isEmpty else { return nil }
+        return Set(list)
+    }
+
+    /// The Mac's Tailscale addresses tablets may use (see `allowedTailnetKey`).
+    static func allowedTailnetAddresses() -> [String] {
+        let all = tailnetAddresses()
+        guard let allow = tailnetAllowlist else { return all }
+        return all.filter { allow.contains($0) }
+    }
+
+    /// Every address a paired tablet may try: home network first, then Tailscale for when
+    /// it's away.
+    static func pairingHosts() -> [String] {
+        var seen = Set<String>()
+        return (lanAddresses() + allowedTailnetAddresses()).filter { seen.insert($0).inserted }
+    }
+
+    /// The IPv4 address of an endpoint (plain or IPv4-mapped IPv6), as dotted text.
+    static func ipv4String(_ endpoint: NWEndpoint?) -> String? {
+        guard let endpoint, case let .hostPort(host, _) = endpoint else { return nil }
+        let raw: Data
+        switch host {
+        case .ipv4(let a): raw = a.rawValue
+        case .ipv6(let a):
+            let r = a.rawValue
+            guard r.count == 16, r.prefix(10).allSatisfy({ $0 == 0 }), r[10] == 0xFF, r[11] == 0xFF else { return nil }
+            raw = r.suffix(4)
+        default: return nil
+        }
+        guard raw.count == 4 else { return nil }
+        return raw.map(String.init).joined(separator: ".")
+    }
+
+    /// True when a connection reached the Mac through one of its Tailscale addresses
+    /// (the tablet is away from home).
+    static func arrivedViaTailnet(_ conn: NWConnection) -> Bool {
+        guard let local = ipv4String(conn.currentPath?.localEndpoint) else { return false }
+        return isTailnetIPv4(local)
+    }
+
+    /// True when a connection reached the Mac through a tailnet that isn't allowed — the
+    /// Mac's own address it connected to is a Tailscale one outside the allowlist.
+    static func arrivedViaBlockedTailnet(localAddress: String?) -> Bool {
+        guard let local = localAddress, isTailnetIPv4(local), let allow = tailnetAllowlist else { return false }
+        return !allow.contains(local)
+    }
+
     /// Read the auth packet from a fresh non-loopback connection; calls back with the
     /// verdict on `queue`. Times out after 3 s.
     static func authenticate(_ conn: NWConnection, queue: DispatchQueue, completion: @escaping (Bool) -> Void) {
@@ -86,6 +174,9 @@ enum NetworkAccess {
         queue.asyncAfter(deadline: .now() + 3) { finish(false) }
         conn.receive(minimumIncompleteLength: authPacketLength, maximumLength: authPacketLength) { data, _, _, error in
             queue.async {
+                if arrivedViaBlockedTailnet(localAddress: ipv4String(conn.currentPath?.localEndpoint)) {
+                    return finish(false)
+                }
                 guard error == nil, let data = data, data.count == authPacketLength else { return finish(false) }
                 let bytes = [UInt8](data)
                 guard bytes[0] == magicAuth[0], bytes[1] == magicAuth[1] else { return finish(false) }

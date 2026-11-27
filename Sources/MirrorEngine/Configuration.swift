@@ -15,7 +15,7 @@ let TARGET_FPS: Int = 60  // DC-1 panel supports up to 120Hz; 60fps viable with 
 let JPEG_QUALITY: CGFloat = 0.8
 /// Minimum companion APK versionCode (android/app/build.gradle.kts) that speaks this
 /// protocol (color mode, tiled deltas, e-ink commands). Older APKs are reinstalled.
-let COMPANION_VERSION_CODE: Int = 8
+let COMPANION_VERSION_CODE: Int = 10
 let KEYFRAME_INTERVAL: Int = 60
 
 // Image processing for reflective paper displays (greyscale).

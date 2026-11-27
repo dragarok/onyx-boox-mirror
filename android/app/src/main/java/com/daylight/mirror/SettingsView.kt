@@ -29,6 +29,7 @@ class SettingsView(context: Context) : FrameLayout(context) {
 
     private val status: TextView
     private val modeControl = EinkUi.Segmented(context) { v -> changeAndClose("mode", v) }
+    private val modeNote: TextView
     private val resolutionControls = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
     private val colorControl = EinkUi.Segmented(context) { v -> changeAndClose("color", v) }
     private val einkControl = EinkUi.Segmented(context) { v -> onSet?.invoke("eink", v); describeEink(v) }
@@ -59,6 +60,11 @@ class SettingsView(context: Context) : FrameLayout(context) {
         }
 
         modeControl.setOptions(listOf("mirror" to "Mirror Mac", "extend" to "Second monitor"))
+        modeNote = text(16f, EinkUi.SECONDARY).apply {
+            gravity = Gravity.START
+            text = "Mirroring only over Tailscale. Second monitor works on USB or the same Wi-Fi as the Mac."
+            visibility = View.GONE
+        }
         colorControl.setOptions(listOf("on" to "Colour", "off" to "Greyscale"))
         einkControl.setOptions(listOf("auto" to "Auto", "quality" to "Quality", "balanced" to "Balanced", "fast" to "Fast"))
         einkHint = text(15f, EinkUi.SECONDARY).apply {
@@ -75,6 +81,7 @@ class SettingsView(context: Context) : FrameLayout(context) {
             orientation = LinearLayout.VERTICAL
             addView(section("Use the BOOX as"))
             addView(modeControl, fill())
+            addView(modeNote, fill())
             addView(section("Resolution"))
             addView(resolutionControls, fill())
         }
@@ -152,6 +159,9 @@ class SettingsView(context: Context) : FrameLayout(context) {
         val running = settings["state"] == "running" || settings["state"] == "starting"
         status.text = if (running) "$macName · connected over $via" else "$macName · not mirroring"
         modeControl.select(if (settings["mode"] == "extended") "extend" else "mirror")
+        val away = settings["remote"] == "1"
+        modeControl.visibility = if (away) View.GONE else View.VISIBLE
+        modeNote.visibility = if (away) View.VISIBLE else View.GONE
         colorControl.select(if (settings["color"] == "1") "on" else "off")
         val eink = settings["eink"] ?: "auto"
         einkControl.select(eink)

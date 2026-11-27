@@ -162,6 +162,15 @@ class MirrorActivity : Activity() {
     @Suppress("unused")
     fun onConnectedHost(host: String) {
         runOnUiThread {
+            if (host.startsWith("127.")) remote = false
+            streamHost = host
+            if (!host.startsWith("127.") && !isConnected) {
+                // The Mac answered; the first picture can take a while on a slow link
+                remote = isTailnet(host)
+                startingUntil = maxOf(startingUntil, System.currentTimeMillis() + 30_000)
+                showOverlay("Connecting to $macName…",
+                    if (remote) "Over Tailscale — the first picture can take a few seconds" else null)
+            }
             handler.removeCallbacks(usbProbe)
             if (!host.startsWith("127.")) handler.postDelayed(usbProbe, 3000)
             if (touchSender?.host == host) return@runOnUiThread
@@ -172,10 +181,15 @@ class MirrorActivity : Activity() {
 
     /// While streaming over Wi-Fi, check every 3 s whether the USB tunnel serves the stream
     /// (cable plugged in, or it came up after Wi-Fi won the race) and move to it.
+    /// Keeps checking for as long as the stream is off the cable — including while the first
+    /// picture is still crawling in over a slow Tailscale relay (no reason to wait for it).
+    @Volatile private var streamHost: String? = null
+
     private val usbProbe = object : Runnable {
         override fun run() {
-            if (!isConnected || touchSender?.host?.startsWith("127.") != false) return
-            remoteExecutor.execute {
+            val host = streamHost
+            if (host == null || host.startsWith("127.") || isFinishing) return
+            Thread {
                 val usbUp = try {
                     java.net.Socket().use { s ->
                         s.connect(java.net.InetSocketAddress("127.0.0.1", 8888), 300)
@@ -184,14 +198,15 @@ class MirrorActivity : Activity() {
                     }
                 } catch (e: Exception) { false }
                 runOnUiThread {
-                    if (usbUp && isConnected) {
-                        android.util.Log.i("DaylightMirror", "USB available — switching from Wi-Fi")
+                    if (streamHost != host) return@runOnUiThread   // already moved on
+                    if (usbUp) {
+                        android.util.Log.i("DaylightMirror", "USB available — switching from $host")
                         nativeSwitchToUSB()
                     } else {
                         handler.postDelayed(this, 3000)
                     }
                 }
-            }
+            }.start()
         }
     }
 
@@ -205,6 +220,14 @@ class MirrorActivity : Activity() {
     private val remoteExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     @Volatile private var pollInFlight = false
     @Volatile private var macHost: String? = null
+    /// Reached the Mac over Tailscale (away from home): mirroring only.
+    private var remote = false
+
+    /// 100.64.0.0/10 — Tailscale addresses.
+    private fun isTailnet(host: String?): Boolean {
+        val p = host?.split(".")?.mapNotNull { it.toIntOrNull() } ?: return false
+        return p.size == 4 && p[0] == 100 && p[1] in 64..127
+    }
     private var macName = "your Mac"
     private var startingUntil = 0L
     private var lastKnownMode = "mirror"
@@ -212,7 +235,9 @@ class MirrorActivity : Activity() {
     private lateinit var settings: SettingsView
     /// Auto-start the remembered mode once per app open (never fight a stop from the Mac).
     private var autoStartArmed = true
-    private val autoStart = Runnable { rememberedMode?.let { requestStart(it, auto = true) } }
+    private val autoStart = Runnable {
+        rememberedMode?.let { requestStart(if (remote) "mirror" else it, auto = true) }
+    }
 
     /// "Remember my choice": the mode to start automatically, or null to ask.
     private var rememberedMode: String?
@@ -230,15 +255,17 @@ class MirrorActivity : Activity() {
 
     private fun remoteHosts(): List<String> {
         val wifi = if (pairingToken != null) candidateHosts().filter { !it.startsWith("127.") } else emptyList()
-        return (listOfNotNull(macHost) + "127.0.0.1" + wifi).distinct()
+        // USB first, always: a cable beats Wi-Fi and Tailscale (and keeps second monitor)
+        return (listOf("127.0.0.1") + listOfNotNull(macHost) + wifi).distinct()
     }
 
     /// One request to the Mac's remote-control port; returns its reply line, or null.
     private fun sendRemote(host: String, command: String): String? {
         return try {
             java.net.Socket().use { s ->
-                s.connect(java.net.InetSocketAddress(host, REMOTE_PORT), if (host.startsWith("127.")) 500 else 1500)
-                s.soTimeout = 3000
+                s.connect(java.net.InetSocketAddress(host, REMOTE_PORT),
+                    if (host.startsWith("127.")) 500 else if (isTailnet(host)) 4000 else 1500)
+                s.soTimeout = if (isTailnet(host)) 8000 else 3000
                 val out = s.getOutputStream()
                 if (!host.startsWith("127.")) {
                     val token = pairingToken ?: return null
@@ -277,6 +304,7 @@ class MirrorActivity : Activity() {
             return
         }
         macHost = found.first
+        remote = isTailnet(found.first)
         val parts = found.second.split(" ", limit = 4)
         val state = parts.getOrNull(1) ?: "idle"
         val lastMode = parts.getOrNull(2) ?: "mirror"
@@ -292,11 +320,11 @@ class MirrorActivity : Activity() {
                     // Remembered choice: start it, with a moment to pick another
                     autoStartArmed = false
                     startingUntil = System.currentTimeMillis() + 22_000
-                    chooser.showStarting(modeLabel(remembered), macName)
+                    chooser.showStarting(modeLabel(if (remote) "mirror" else remembered), macName)
                     chooser.visibility = View.VISIBLE
                     handler.postDelayed(autoStart, 1500)
                 } else {
-                    chooser.showChooser(macName, lastMode, remembered != null)
+                    chooser.showChooser(macName, lastMode, remembered != null, remote)
                     chooser.visibility = View.VISIBLE
                 }
             }
@@ -380,7 +408,12 @@ class MirrorActivity : Activity() {
                     val i = it.indexOf('=')
                     if (i <= 0) null else it.substring(0, i) to it.substring(i + 1)
                 }.toMap()
-                val via = if ((touchSender?.host ?: host).startsWith("127.")) "USB" else "Wi-Fi"
+                val streamHost = touchSender?.host ?: host
+                val via = when {
+                    streamHost.startsWith("127.") -> "USB"
+                    isTailnet(streamHost) -> "Tailscale"
+                    else -> "Wi-Fi"
+                }
                 map["mode"]?.let { lastKnownMode = it }
                 settings.update(map, macName, via, rememberedMode != null)
             }
@@ -479,14 +512,15 @@ class MirrorActivity : Activity() {
         // Status / mode chooser — shown while no stream is connected
         chooser = ChooserView(this).apply {
             onPick = { mode, remember ->
-                rememberedMode = if (remember) mode else null
+                // Away, only mirroring is offered: keep the home choice for when you're back
+                rememberedMode = if (!remember) null else if (remote) (rememberedMode ?: mode) else mode
                 requestStart(mode)
             }
             onChange = {
                 handler.removeCallbacks(autoStart)
                 autoStartArmed = false
                 startingUntil = 0
-                showChooser(macName, lastKnownMode, rememberedMode != null)
+                showChooser(macName, lastKnownMode, rememberedMode != null, remote)
             }
             onSettings = { openSettings() }
         }

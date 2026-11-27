@@ -128,16 +128,19 @@ class ChooserView(context: Context) : FrameLayout(context) {
     }
 
     /// lastMode: the Mac's current setting ("mirror" / "extended"), marked "Last used".
-    fun showChooser(macName: String, lastMode: String, remembered: Boolean) {
-        val key = "chooser|$macName|$lastMode"
+    /// `remote`: reached over Tailscale — only mirroring is offered.
+    fun showChooser(macName: String, lastMode: String, remembered: Boolean, remote: Boolean = false) {
+        val key = "chooser|$macName|$lastMode|$remote"
         if (shown == key) return
         val entering = shown?.startsWith("chooser|") != true
         shown = key
         title.text = "$macName is ready"
-        subtitle.text = "How do you want to use the BOOX?"
+        subtitle.text = if (remote) "Over Tailscale — second monitor needs USB or the same Wi-Fi"
+                        else "How do you want to use the BOOX?"
         subtitle.visibility = View.VISIBLE
-        mirrorCard.setLastUsed(lastMode == "mirror")
+        mirrorCard.setLastUsed(!remote && lastMode == "mirror")
         extendCard.setLastUsed(lastMode == "extended" || lastMode == "extend")
+        extendCard.visibility = if (remote) View.GONE else View.VISIBLE
         if (entering) rememberRow.checked = remembered
         cards.visibility = View.VISIBLE
         rememberRow.visibility = View.VISIBLE

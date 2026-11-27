@@ -12,8 +12,8 @@ android {
         applicationId = "com.daylight.mirror"
         minSdk = 24
         targetSdk = 34
-        versionCode = 8
-        versionName = "2.6-boox"
+        versionCode = 10
+        versionName = "2.7.1-boox"
 
         ndk {
             abiFilters += listOf("arm64-v8a")

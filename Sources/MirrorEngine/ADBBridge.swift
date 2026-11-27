@@ -191,11 +191,18 @@ struct ADBBridge {
     /// over wireless adb ("ip:port" serials) and emulators must never get a session.
     static func filterSupported(_ all: [ConnectedDevice]) -> [ConnectedDevice] {
         let supported = all.filter { $0.deviceFamily.isSupported }
-        if supported.isEmpty, all.count == 1, let lone = all.first,
-           !lone.serial.contains(":"), !lone.serial.hasPrefix("emulator-") {
+        if supported.isEmpty, all.count == 1, let lone = all.first, isCabled(serial: lone.serial) {
             return all
         }
         return supported
+    }
+
+    /// True for a device on a USB cable. Wireless adb shows up as "ip:port" or, when found
+    /// by Wireless debugging, "adb-<serial>-<id>._adb-tls-connect._tcp"; emulators as
+    /// "emulator-NNNN". Only cabled devices get the lone-device DC-1 fallback — a phone
+    /// on wireless debugging must never be mirrored to.
+    static func isCabled(serial: String) -> Bool {
+        !serial.contains(":") && !serial.contains("._tcp") && !serial.hasPrefix("emulator-")
     }
 
     /// Returns the serial of the first connected device (legacy convenience).

@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.7-boox] — 2026-11-27 (Onyx BOOX fork)
+
+### Added
+- Tailscale: the Mac hands its Tailscale address to the BOOX when paired over USB, so the tablet can find it away from home
+- `tailscaleAddresses` setting picks which of the Mac's tailnets tablets may use; connections through any other tailnet are refused (`defaults write com.daylight.mirror tailscaleAddresses -array <ip>`)
+- Mirroring only over Tailscale: a second-monitor request becomes mirroring, a second-monitor session switches to mirroring when the tablet reconnects from away, and the BOOX offers only "Mirror Mac"
+- BOOX shows "Connecting to <Mac>…" while the first picture loads on a slow link
+- USB always wins: the BOOX asks the Mac over the cable first, and the Mac keeps second monitor when the BOOX is on USB even if a connection arrives over Tailscale
+
+### Fixed
+- A phone on Android wireless debugging (mDNS serial `adb-…._adb-tls-connect._tcp`) was treated as a lone DC-1 and mirrored to
+- The BOOX stopped checking for the cable if the first picture hadn't arrived yet (slow Tailscale relay), so it could stay off USB
+
 ## [2.6-boox] — 2026-11-27 (Onyx BOOX fork)
 
 ### Added

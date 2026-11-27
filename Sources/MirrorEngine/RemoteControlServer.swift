@@ -20,10 +20,11 @@ import SystemConfiguration
 final class RemoteControlServer {
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "remote-control")
-    private let handler: @MainActor (String) -> String
+    /// (command line, arrived over Tailscale) → reply line
+    private let handler: @MainActor (String, Bool) -> String
     private(set) var allowNetwork = false
 
-    init(handler: @escaping @MainActor (String) -> String) {
+    init(handler: @escaping @MainActor (String, Bool) -> String) {
         self.handler = handler
     }
 
@@ -96,8 +97,9 @@ final class RemoteControlServer {
                 let line = String(decoding: buf[buf.startIndex..<nl], as: UTF8.self)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let handler = self.handler
+                let viaTailnet = NetworkAccess.arrivedViaTailnet(conn)
                 Task { @MainActor in
-                    let reply = handler(line)
+                    let reply = handler(line, viaTailnet)
                     conn.send(content: Data((reply + "\n").utf8), completion: .contentProcessed { _ in
                         conn.cancel()
                     })

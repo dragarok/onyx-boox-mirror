@@ -42,6 +42,7 @@ public class DeviceSession: Identifiable {
 
     var onStatsChanged: (() -> Void)?
     var onClientCountChanged: ((Int) -> Void)?
+    var onTailnetClient: (() -> Void)?
     var onLatencyStats: ((LatencyStats) -> Void)?
 
     /// Wireless: servers also accept paired clients over the LAN.
@@ -105,6 +106,7 @@ public class DeviceSession: Identifiable {
         tcp.frameHeight = UInt16(h)
         tcp.isColorMode = useColor
         tcp.sendsEinkState = family == .boox
+        tcp.onTailnetClient = { [weak self] in self?.onTailnetClient?() }
         tcp.onClientCountChanged = { [weak self] count in
             self?.clientCount = count
             self?.onClientCountChanged?(count)
@@ -197,7 +199,7 @@ public class DeviceSession: Identifiable {
                 // secret and this Mac's LAN addresses.
                 if relaunchCompanion {
                     ADBBridge.launchApp(serial: serial, forceRestart: true,
-                                        pairing: (NetworkAccess.secretHex, NetworkAccess.lanAddresses()))
+                                        pairing: (NetworkAccess.secretHex, NetworkAccess.pairingHosts()))
                 }
                 adbConnected = true
                 return

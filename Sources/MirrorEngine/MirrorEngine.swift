@@ -153,8 +153,8 @@ public class MirrorEngine: ObservableObject {
 
     private func updateRemoteServer() {
         if remoteServer == nil {
-            remoteServer = RemoteControlServer { [weak self] line in
-                self?.handleRemote(line) ?? "ERR shutting down"
+            remoteServer = RemoteControlServer { [weak self] line, viaTailnet in
+                self?.handleRemote(line, viaTailnet: viaTailnet) ?? "ERR shutting down"
             }
         }
         remoteServer?.start(allowNetwork: wirelessEnabled)
@@ -192,8 +192,11 @@ public class MirrorEngine: ObservableObject {
     }
 
     @MainActor
-    func handleRemote(_ line: String) -> String {
+    /// Away from home (over Tailscale) only mirror mode makes sense: a second monitor would
+    /// be a screen nobody near the Mac can use, and the tablet can't see the real one.
+    func handleRemote(_ line: String, viaTailnet arrivedViaTailnet: Bool = false) -> String {
         let parts = line.split(separator: " ").map { $0.lowercased() }
+        let viaTailnet = arrivedViaTailnet && !booxOnUSB
         switch parts.first ?? "" {
         case "status":
             return "OK \(statusWord) \(displayMode.rawValue) \(RemoteControlServer.computerName)"
@@ -204,6 +207,10 @@ public class MirrorEngine: ObservableObject {
                     return "ERR unknown mode (mirror, extend)"
                 }
                 mode = m
+            }
+            if viaTailnet {
+                if mode == .extended { NSLog("[Remote] Second monitor asked over Tailscale — mirroring instead") }
+                mode = .mirror
             }
             return remoteStart(mode: mode)
         case "release":
@@ -221,9 +228,12 @@ public class MirrorEngine: ObservableObject {
             refreshScreen()
             return "OK refreshed"
         case "settings":
-            return "OK " + remoteSettings()
+            return "OK " + remoteSettings() + (viaTailnet ? ";remote=1" : "")
         case "set":
             guard parts.count >= 3 else { return "ERR usage: SET <mode|resolution|color|eink> <value>" }
+            if viaTailnet, parts[1] == "mode", parts[2] != "mirror" {
+                return "ERR Second monitor needs USB or the same Wi-Fi as the Mac"
+            }
             return remoteSet(parts[1], parts[2])
         default:
             return "ERR unknown command"
@@ -329,6 +339,28 @@ public class MirrorEngine: ObservableObject {
         }
     }
 
+    /// A tablet reconnected over Tailscale to a second-monitor session (it left home while
+    /// extended): switch to mirroring so it shows the Mac's real screen.
+    /// Not when the BOOX is on USB — then Tailscale only won a start-up race and the
+    /// stream moves to the cable within seconds.
+    @MainActor
+    private func tailnetClientArrived() {
+        guard status == .running, displayMode == .extended else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let cabled = Self.booxCabled(ADBBridge.connectedDevices())
+            DispatchQueue.main.async {
+                guard let self, self.status == .running, self.displayMode == .extended else { return }
+                if cabled {
+                    NSLog("[Remote] Tailscale connection, but the BOOX is on USB — keeping second monitor")
+                    return
+                }
+                NSLog("[Remote] Tablet is away (Tailscale) — switching to mirror mode")
+                self.displayMode = .mirror
+                self.restartKeepingOrigin()
+            }
+        }
+    }
+
     /// Device-started sessions stop once the device has been gone for `remoteIdleGrace`.
     private func scheduleRemoteIdleCheck() {
         remoteIdleStop?.cancel()
@@ -358,7 +390,7 @@ public class MirrorEngine: ObservableObject {
         }
         _ = ADBBridge.setupReverseTunnel(serial: serial, devicePort: REMOTE_PORT, hostPort: REMOTE_PORT)
         ADBBridge.launchApp(serial: serial, forceRestart: false,
-                            pairing: (NetworkAccess.secretHex, NetworkAccess.lanAddresses()))
+                            pairing: (NetworkAccess.secretHex, NetworkAccess.pairingHosts()))
     }
 
     /// USB device appeared while idle: a BOOX gets the chooser, anything else auto-starts
@@ -404,6 +436,13 @@ public class MirrorEngine: ObservableObject {
     /// Families of supported devices currently on USB (refreshed on plug events) — lets
     /// the idle menu show the right controls before mirroring starts.
     @Published public var attachedFamilies: Set<DeviceFamily> = []
+    /// A BOOX is on the USB cable: it's at the Mac, so Tailscale rules (mirror only) don't
+    /// apply even if a connection happens to arrive over Tailscale.
+    private var booxOnUSB = false
+
+    private static func booxCabled(_ devices: [ConnectedDevice]) -> Bool {
+        devices.contains { $0.deviceFamily == .boox && ADBBridge.isCabled(serial: $0.serial) }
+    }
 
     /// Re-read attached devices over adb off the main thread; also re-detects the
     /// BOOX panel size so preset labels are accurate.
@@ -421,7 +460,11 @@ public class MirrorEngine: ObservableObject {
                 _ = ADBBridge.setupReverseTunnel(serial: boox.serial, devicePort: REMOTE_PORT, hostPort: REMOTE_PORT)
             }
             let families = Set(devices.map { $0.deviceFamily == .other ? .daylightDC1 : $0.deviceFamily })
-            DispatchQueue.main.async { self?.attachedFamilies = families }
+            let cabled = Self.booxCabled(devices)
+            DispatchQueue.main.async {
+                self?.attachedFamilies = families
+                self?.booxOnUSB = cabled
+            }
         }
     }
 
@@ -795,6 +838,9 @@ public class MirrorEngine: ObservableObject {
         session.onStatsChanged = { [weak self] in
             DispatchQueue.main.async { self?.aggregateStats() }
         }
+        session.onTailnetClient = { [weak self] in
+            DispatchQueue.main.async { self?.tailnetClientArrived() }
+        }
         session.onClientCountChanged = { [weak self] _ in
             DispatchQueue.main.async { self?.aggregateClientCount() }
         }
@@ -956,7 +1002,7 @@ public class MirrorEngine: ObservableObject {
                     _ = ADBBridge.setupReverseTunnel(serial: serial, devicePort: REMOTE_PORT, hostPort: REMOTE_PORT)
                     // Refresh pairing; the app notices the tunnel and moves off Wi-Fi itself
                     ADBBridge.launchApp(serial: serial, forceRestart: false,
-                                        pairing: (NetworkAccess.secretHex, NetworkAccess.lanAddresses()))
+                                        pairing: (NetworkAccess.secretHex, NetworkAccess.pairingHosts()))
                     NSLog("[ADB] Reconnected %@ over USB", serial)
                 }
             }

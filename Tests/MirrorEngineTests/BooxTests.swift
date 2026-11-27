@@ -122,6 +122,14 @@ final class DeviceFilterTests: XCTestCase {
         XCTAssertTrue(ADBBridge.filterSupported([phone]).isEmpty)
     }
 
+    func testWirelessDebuggingPhoneIsNeverTreatedAsDC1() {
+        // Found via mDNS by Android 11+ Wireless debugging: no ":" in the serial
+        let phone = ConnectedDevice(serial: "adb-3a5860ce-L8fAPf._adb-tls-connect._tcp",
+                                    model: "25053PC47I", product: "onyx_in", deviceName: "onyx")
+        XCTAssertTrue(ADBBridge.filterSupported([phone]).isEmpty)
+        XCTAssertFalse(ADBBridge.isCabled(serial: "adb-3a5860ce-L8fAPf._adb._tcp"))
+    }
+
     func testEmulatorIsNeverTreatedAsDC1() {
         let emu = ConnectedDevice(serial: "emulator-5554", model: "sdk_gphone64_arm64")
         XCTAssertTrue(ADBBridge.filterSupported([emu]).isEmpty)

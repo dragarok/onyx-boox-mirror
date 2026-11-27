@@ -25,6 +25,8 @@ class TCPServer {
     let lock = NSLock()
     var lastKeyframeData: Data?
     var onClientCountChanged: ((Int) -> Void)?
+    /// A tablet started watching over Tailscale (away from home)
+    var onTailnetClient: (() -> Void)?
     var onLatencyStats: ((LatencyStats) -> Void)?
     private(set) var latencyStats: LatencyStats?
     var frameWidth: UInt16 = 1024 {
@@ -113,6 +115,7 @@ class TCPServer {
                             if ok {
                                 print("[TCP] Wi-Fi client paired: \(conn.endpoint)")
                                 self.admit(conn)
+                                if NetworkAccess.arrivedViaTailnet(conn) { self.onTailnetClient?() }
                             } else {
                                 print("[TCP] Rejected unpaired client \(conn.endpoint)")
                                 conn.cancel()
