@@ -1,0 +1,28 @@
+{
+  "label": "usb",
+  "time": "2026-11-27T09:10:05",
+  "phase_seconds": 15,
+  "phases": {
+    "typing": {
+      "fps": 6.3,
+      "rtt_avg_ms": 17.9,
+      "rtt_p95_ms": 109.1,
+      "bandwidth_mbps": 0.03,
+      "samples": 28
+    },
+    "scrolling": {
+      "fps": 27.7,
+      "rtt_avg_ms": 114.2,
+      "rtt_p95_ms": 230.5,
+      "bandwidth_mbps": 7.93,
+      "samples": 27
+    },
+    "pageflip": {
+      "fps": 9.1,
+      "rtt_avg_ms": 113.2,
+      "rtt_p95_ms": 166.5,
+      "bandwidth_mbps": 6.44,
+      "samples": 28
+    }
+  }
+}

@@ -1,9 +1,11 @@
 // ScreenCapture.swift — CPU-only screen capture with vImage SIMD + LZ4 delta.
 //
 // Captures the virtual display via CGDisplayStream (loaded at runtime via dlsym
-// to bypass macOS 15 SDK deprecation), converts BGRA to greyscale using vImage
-// SIMD, optionally sharpens with Laplacian convolution, applies contrast LUT,
-// then LZ4 compresses (keyframe or XOR delta). Zero GPU usage.
+// to bypass macOS 15 SDK deprecation), converts BGRA to greyscale (1 B/px) or RGB
+// (3 B/px, for color e-ink) using vImage SIMD, optionally sharpens with a Laplacian
+// convolution, applies a gamma+contrast LUT, then sends either an LZ4 keyframe or
+// a lossless delta. Deltas are tiled: only 64x64 tiles that changed are XORed and
+// compressed, so typing a character costs a few hundred bytes. Zero GPU usage.
 
 import Foundation
 import Darwin
@@ -58,11 +60,26 @@ class ScreenCapture: NSObject {
     private var cgHandle: UnsafeMutableRawPointer?       // dlopen handle
     private(set) var displayStream: OpaquePointer?         // retained stream ref
 
+    /// Converted frame (greyscale or RGB) and the frame the client currently shows.
+    /// Invariant: `previousGray` always equals the client's buffer after a send.
     var currentGray: UnsafeMutablePointer<UInt8>?
     var previousGray: UnsafeMutablePointer<UInt8>?
     var deltaBuffer: UnsafeMutablePointer<UInt8>?
     var compressedBuffer: UnsafeMutablePointer<CChar>?
-    var sharpenTemp: UnsafeMutablePointer<UInt8>?  // Pre-sharpen greyscale buffer
+    var compressedCapacity: Int = 0
+    var sharpenTemp: UnsafeMutablePointer<UInt8>?  // Pre-sharpen buffer (grey: 1 B/px, color: BGRA 4 B/px)
+    var tileDelta: UnsafeMutablePointer<UInt8>?    // Scratch for one tile's XOR delta
+    var dirtyBitmap: [UInt8] = []
+
+    /// RGB (3 B/px) instead of greyscale. Fixed for the stream's lifetime.
+    let useColor: Bool
+    var bytesPerPixel: Int { useColor ? 3 : 1 }
+    var bufferSize: Int = 0
+    /// Capture rate for this stream (the DC-1 runs at 60, e-ink panels at 30).
+    let targetFPS: Int
+    /// Frames between scheduled keyframes. Tiled deltas are lossless, so keyframes are
+    /// only a safety net (and the base for clients that join mid-stream).
+    var keyframeInterval: Int { targetFPS * 3 }
     var contrastLUT: [UInt8] = Array(0...255)       // Combined gamma+contrast LUT
     var lastContrastAmount: Double = 1.0           // Tracks when to rebuild LUT
     var lastGammaAmount: Double = 1.0              // Tracks when to rebuild LUT
@@ -85,6 +102,8 @@ class ScreenCapture: NSObject {
     var convertTimeSum: Double = 0
     var compressTimeSum: Double = 0
     var statFrames: Int = 0
+    var sentStatFrames: Int = 0   // frames actually sent (idle callbacks excluded)
+    var tiledFrames: Int = 0
     var lastCompressedSize: Int = 0
 
     // Jitter tracking: measures interval variance between callbacks
@@ -98,12 +117,15 @@ class ScreenCapture: NSObject {
     let expectedWidth: Int
     let expectedHeight: Int
 
-    init(tcpServer: TCPServer, wsServer: WebSocketServer?, targetDisplayID: CGDirectDisplayID, width: Int, height: Int) {
+    init(tcpServer: TCPServer, wsServer: WebSocketServer?, targetDisplayID: CGDirectDisplayID,
+         width: Int, height: Int, useColor: Bool = false, targetFPS: Int = TARGET_FPS) {
         self.tcpServer = tcpServer
         self.wsServer = wsServer
         self.targetDisplayID = targetDisplayID
         self.expectedWidth = width
         self.expectedHeight = height
+        self.useColor = useColor
+        self.targetFPS = targetFPS
         self.ciContext = CIContext(options: [.useSoftwareRenderer: false])
         super.init()
     }
@@ -119,16 +141,22 @@ class ScreenCapture: NSObject {
         frameWidth = expectedWidth
         frameHeight = expectedHeight
         pixelCount = frameWidth * frameHeight
+        bufferSize = pixelCount * bytesPerPixel
 
-        currentGray = .allocate(capacity: pixelCount)
-        previousGray = .allocate(capacity: pixelCount)
-        deltaBuffer = .allocate(capacity: pixelCount)
-        sharpenTemp = .allocate(capacity: pixelCount)
-        let maxCompressed = LZ4_compressBound(Int32(pixelCount))
-        compressedBuffer = .allocate(capacity: Int(maxCompressed))
-        previousGray!.initialize(repeating: 0, count: pixelCount)
+        currentGray = .allocate(capacity: bufferSize)
+        previousGray = .allocate(capacity: bufferSize)
+        deltaBuffer = .allocate(capacity: bufferSize)
+        sharpenTemp = .allocate(capacity: pixelCount * (useColor ? 4 : 1))
+        tileDelta = .allocate(capacity: TILE_SIZE * TILE_SIZE * bytesPerPixel)
+        let tileCount = tileCols * tileRows
+        dirtyBitmap = [UInt8](repeating: 0, count: (tileCount + 7) / 8)
+        // Room for a full-frame LZ4 block, or a tiled payload (header + bitmap +
+        // per-tile length prefix + per-tile LZ4 slack).
+        compressedCapacity = Int(LZ4_compressBound(Int32(bufferSize))) + tileCount * 24 + dirtyBitmap.count + 64
+        compressedBuffer = .allocate(capacity: compressedCapacity)
+        previousGray!.initialize(repeating: 0, count: bufferSize)
 
-        print("Capturing display: \(expectedWidth)x\(expectedHeight) pixels (ID: \(targetDisplayID))")
+        print("Capturing display: \(expectedWidth)x\(expectedHeight) pixels (ID: \(targetDisplayID)) [\(useColor ? "RGB" : "greyscale"), \(targetFPS)fps]")
 
         // Load CGDisplayStream functions via dlsym
         guard let cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY) else {
@@ -154,7 +182,7 @@ class ScreenCapture: NSObject {
 
         // CGDisplayStream configuration
         let properties: NSDictionary = [
-            "kCGDisplayStreamMinimumFrameTime": NSNumber(value: 1.0 / Double(TARGET_FPS)),
+            "kCGDisplayStreamMinimumFrameTime": NSNumber(value: 1.0 / Double(targetFPS)),
             "kCGDisplayStreamShowCursor": kCFBooleanTrue as Any
         ]
 
@@ -192,7 +220,7 @@ class ScreenCapture: NSObject {
         }
 
         lastStatTime = Date()
-        print("Capture started at \(TARGET_FPS)fps -- CGDisplayStream + vImage + LZ4 delta (zero GPU)")
+        print("Capture started at \(targetFPS)fps -- CGDisplayStream + vImage + tiled LZ4 delta (zero GPU)")
     }
 
     func stop() async {
@@ -215,8 +243,12 @@ class ScreenCapture: NSObject {
         previousGray?.deallocate(); previousGray = nil
         deltaBuffer?.deallocate(); deltaBuffer = nil
         sharpenTemp?.deallocate(); sharpenTemp = nil
+        tileDelta?.deallocate(); tileDelta = nil
         compressedBuffer?.deallocate(); compressedBuffer = nil
     }
+
+    var tileCols: Int { (frameWidth + TILE_SIZE - 1) / TILE_SIZE }
+    var tileRows: Int { (frameHeight + TILE_SIZE - 1) / TILE_SIZE }
 
     /// Stop the CGDisplayStream without releasing buffers.
     private func stopStream() {
@@ -279,7 +311,7 @@ class ScreenCapture: NSObject {
         let startFn = unsafeBitCast(startSym, to: CGDisplayStreamStartFn.self)
 
         let properties: NSDictionary = [
-            "kCGDisplayStreamMinimumFrameTime": NSNumber(value: 1.0 / Double(TARGET_FPS)),
+            "kCGDisplayStreamMinimumFrameTime": NSNumber(value: 1.0 / Double(targetFPS)),
             "kCGDisplayStreamShowCursor": kCFBooleanTrue as Any
         ]
 
@@ -330,7 +362,7 @@ class ScreenCapture: NSObject {
 
         if lastCallbackTime > 0 {
             let interval = (t0 - lastCallbackTime) * 1000.0
-            let expectedInterval = 1000.0 / Double(TARGET_FPS)
+            let expectedInterval = 1000.0 / Double(targetFPS)
             let jitter = abs(interval - expectedInterval)
             jitterSamples.append(jitter)
             if jitterSamples.count > jitterWindowSize {
@@ -353,146 +385,163 @@ class ScreenCapture: NSObject {
                   surfW, surfH, surfBPP, rowBytes, frameWidth, frameHeight)
         }
 
+        guard let cur = currentGray, let prev = previousGray, let comp = compressedBuffer else {
+            IOSurfaceUnlock(surface, .readOnly, nil)
+            return
+        }
+
         var srcBuffer = vImage_Buffer(
             data: baseAddress,
             height: vImagePixelCount(frameHeight),
             width: vImagePixelCount(frameWidth),
             rowBytes: rowBytes
         )
-
-        var matrix: [Int16] = [29, 150, 77, 0]
-        let greyDivisor: Int32 = 256
-        var preBias: [Int16] = [0, 0, 0, 0]
-
         let sharpAmt = sharpenAmount
-        let contrastAmt = contrastAmount
+        let a = Int16(sharpAmt * 4)  // Laplacian weight, divisor 4 → 0.25 steps
+        let center = 4 + 4 * a       // (1 + 4*amount) * divisor
+        var kernel: [Int16] = [0, -a, 0, -a, center, -a, 0, -a, 0]
 
-        if sharpAmt > 0.01 {
-            // Greyscale → sharpenTemp, then Laplacian convolve → currentGray
-            // Kernel: [0, -a, 0; -a, 1+4a, -a; 0, -a, 0] with divisor to allow fractional a.
-            // Use divisor=4 for 0.25 step granularity.
-            var preSharpenBuffer = vImage_Buffer(
-                data: sharpenTemp!, height: vImagePixelCount(frameHeight),
-                width: vImagePixelCount(frameWidth), rowBytes: frameWidth
+        if useColor {
+            // BGRA → (optional sharpen in BGRA) → RGB888
+            var rgbBuffer = vImage_Buffer(
+                data: cur, height: vImagePixelCount(frameHeight),
+                width: vImagePixelCount(frameWidth), rowBytes: frameWidth * 3
             )
-            vImageMatrixMultiply_ARGB8888ToPlanar8(
-                &srcBuffer, &preSharpenBuffer, &matrix, greyDivisor, &preBias, 0,
-                vImage_Flags(kvImageNoFlags)
-            )
-            var dstBuffer = vImage_Buffer(
-                data: currentGray!, height: vImagePixelCount(frameHeight),
-                width: vImagePixelCount(frameWidth), rowBytes: frameWidth
-            )
-            let a = Int16(sharpAmt * 4)  // scale by divisor=4
-            let center = 4 + 4 * a       // (1 + 4*amount) * divisor = 4 + 4*a
-            var kernel: [Int16] = [0, -a, 0, -a, center, -a, 0, -a, 0]
-            vImageConvolve_Planar8(
-                &preSharpenBuffer, &dstBuffer, nil, 0, 0,
-                &kernel, 3, 3, 4, 0, vImage_Flags(kvImageEdgeExtend)
-            )
+            if sharpAmt > 0.01, let tmp = sharpenTemp {
+                var sharpBuffer = vImage_Buffer(
+                    data: tmp, height: vImagePixelCount(frameHeight),
+                    width: vImagePixelCount(frameWidth), rowBytes: frameWidth * 4
+                )
+                vImageConvolve_ARGB8888(
+                    &srcBuffer, &sharpBuffer, nil, 0, 0, &kernel, 3, 3, 4, nil,
+                    vImage_Flags(kvImageEdgeExtend)
+                )
+                vImageConvert_BGRA8888toRGB888(&sharpBuffer, &rgbBuffer, vImage_Flags(kvImageNoFlags))
+            } else {
+                vImageConvert_BGRA8888toRGB888(&srcBuffer, &rgbBuffer, vImage_Flags(kvImageNoFlags))
+            }
         } else {
-            // No sharpening — greyscale directly into currentGray
+            var matrix: [Int16] = [29, 150, 77, 0]  // BGRA → luma (BT.601), divisor 256
+            var preBias: [Int16] = [0, 0, 0, 0]
             var dstBuffer = vImage_Buffer(
-                data: currentGray!, height: vImagePixelCount(frameHeight),
+                data: cur, height: vImagePixelCount(frameHeight),
                 width: vImagePixelCount(frameWidth), rowBytes: frameWidth
             )
-            vImageMatrixMultiply_ARGB8888ToPlanar8(
-                &srcBuffer, &dstBuffer, &matrix, greyDivisor, &preBias, 0,
-                vImage_Flags(kvImageNoFlags)
-            )
+            if sharpAmt > 0.01, let tmp = sharpenTemp {
+                var preSharpenBuffer = vImage_Buffer(
+                    data: tmp, height: vImagePixelCount(frameHeight),
+                    width: vImagePixelCount(frameWidth), rowBytes: frameWidth
+                )
+                vImageMatrixMultiply_ARGB8888ToPlanar8(
+                    &srcBuffer, &preSharpenBuffer, &matrix, 256, &preBias, 0,
+                    vImage_Flags(kvImageNoFlags)
+                )
+                vImageConvolve_Planar8(
+                    &preSharpenBuffer, &dstBuffer, nil, 0, 0,
+                    &kernel, 3, 3, 4, 0, vImage_Flags(kvImageEdgeExtend)
+                )
+            } else {
+                vImageMatrixMultiply_ARGB8888ToPlanar8(
+                    &srcBuffer, &dstBuffer, &matrix, 256, &preBias, 0,
+                    vImage_Flags(kvImageNoFlags)
+                )
+            }
         }
 
-        // Combined gamma + contrast enhancement via single precomputed LUT.
-        // Gamma correction adjusts midtones for the reflective paper display
-        // (transfer curve ~1.0-1.5 vs 2.2 for transmissive LCDs).
-        // Contrast stretch pushes light borders darker and dark text blacker.
-        // LUT rebuilt lazily on capture thread to avoid data race with main thread.
+        // Combined gamma + contrast via one LUT, applied to every byte (grey or R/G/B)
+        // with vImage's SIMD table lookup. Gamma lifts midtones for reflective panels;
+        // contrast pushes light borders darker and text blacker.
+        let contrastAmt = contrastAmount
         let gammaAmt = gammaAmount
-        // Combined gamma + contrast enhancement via single precomputed LUT.
-        // Active when either gamma or contrast differs from 1.0 (identity).
-        let needsLUT = abs(contrastAmt - 1.0) > 0.01 || abs(gammaAmt - 1.0) > 0.01
-        if needsLUT {
+        if abs(contrastAmt - 1.0) > 0.01 || abs(gammaAmt - 1.0) > 0.01 {
             if contrastAmt != lastContrastAmount || gammaAmt != lastGammaAmount {
                 contrastLUT = (0..<256).map { i in
                     var val = Double(i) / 255.0
-                    if abs(gammaAmt - 1.0) > 0.01 {
-                        val = pow(val, 1.0 / gammaAmt)
-                    }
-                    val = val * 255.0
-                    if abs(contrastAmt - 1.0) > 0.01 {
-                        val = 128.0 + contrastAmt * (val - 128.0)
-                    }
+                    if abs(gammaAmt - 1.0) > 0.01 { val = pow(val, 1.0 / gammaAmt) }
+                    val *= 255.0
+                    if abs(contrastAmt - 1.0) > 0.01 { val = 128.0 + contrastAmt * (val - 128.0) }
                     return UInt8(max(0, min(255, Int(val))))
                 }
                 lastContrastAmount = contrastAmt
                 lastGammaAmount = gammaAmt
             }
-            let lut = contrastLUT
-            for i in 0..<pixelCount { currentGray![i] = lut[Int(currentGray![i])] }
+            var lutBuffer = vImage_Buffer(
+                data: cur, height: vImagePixelCount(frameHeight),
+                width: vImagePixelCount(frameWidth * bytesPerPixel), rowBytes: frameWidth * bytesPerPixel
+            )
+            contrastLUT.withUnsafeBufferPointer { lut in
+                _ = vImageTableLookUp_Planar8(&lutBuffer, &lutBuffer, lut.baseAddress!, vImage_Flags(kvImageNoFlags))
+            }
         }
 
         let t1 = CACurrentMediaTime()
 
+        if tcpServer.consumeKeyframeRequest() { forceNextKeyframe = true }
+
         // Drop frames when Android can't keep up — send only the latest
         let inflight = tcpServer.inflightFrames
-        let isScheduledKeyframe = (frameCount % KEYFRAME_INTERVAL == 0)
+        let isScheduledKeyframe = (frameCount % keyframeInterval == 0)
 
         let rtt = tcpServer.latencyStats?.rttAvgMs ?? 15.0
         let adaptiveThreshold = adaptiveBackpressureThreshold(rttMs: rtt)
         if inflight > adaptiveThreshold && !isScheduledKeyframe {
             skippedFrames += 1
-            forceNextKeyframe = true
-            // Still swap buffers so currentGray stays fresh for next delta base
-            let temp = previousGray
-            previousGray = currentGray
-            currentGray = temp
-
+            forceNextKeyframe = true  // the client's base is now unknown — resync
             IOSurfaceUnlock(surface, .readOnly, nil)
             frameCount += 1
             return
         }
 
         let isKeyframe = isScheduledKeyframe || forceNextKeyframe
-        if forceNextKeyframe { forceNextKeyframe = false }
-        let seq = frameSequence
-        frameSequence &+= 1
+        var sent = false
 
         if isKeyframe {
+            forceNextKeyframe = false
             let compressedSize = LZ4_compress_default(
-                currentGray!, compressedBuffer!, Int32(pixelCount),
-                LZ4_compressBound(Int32(pixelCount))
+                cur, comp, Int32(bufferSize), Int32(compressedCapacity)
             )
-            let payload = Data(bytes: compressedBuffer!, count: Int(compressedSize))
-            tcpServer.broadcast(payload: payload, isKeyframe: true, sequenceNumber: seq)
+            let payload = Data(bytes: comp, count: Int(compressedSize))
+            tcpServer.broadcast(payload: payload, isKeyframe: true, sequenceNumber: frameSequence)
             lastCompressedSize = Int(compressedSize)
+            sent = true
         } else {
-            for i in 0..<pixelCount {
-                deltaBuffer![i] = currentGray![i] ^ previousGray![i]
-            }
-            let compressedSize = LZ4_compress_default(
-                deltaBuffer!, compressedBuffer!, Int32(pixelCount),
-                LZ4_compressBound(Int32(pixelCount))
-            )
-            // Skip trivial deltas — screen barely changed, Android already has the frame
-            if compressedSize < TRIVIAL_DELTA_THRESHOLD {
-                skippedFrames += 1
-                frameSequence &-= 1  // reclaim sequence number
+            let (dirty, total) = markDirtyTiles(cur: cur, prev: prev)
+            if dirty == 0 {
+                skippedFrames += 1  // Nothing changed — the client already has this frame
+            } else if dirty * 2 > total {
+                // Mostly dirty (scrolling, video) — one whole-frame XOR delta compresses better
+                xorDelta(cur, prev, into: deltaBuffer!, count: bufferSize)
+                let compressedSize = LZ4_compress_default(
+                    deltaBuffer!, comp, Int32(bufferSize), Int32(compressedCapacity)
+                )
+                let payload = Data(bytes: comp, count: Int(compressedSize))
+                tcpServer.broadcast(payload: payload, isKeyframe: false, sequenceNumber: frameSequence)
+                lastCompressedSize = Int(compressedSize)
+                sent = true
             } else {
-                let payload = Data(bytes: compressedBuffer!, count: Int(compressedSize))
-                tcpServer.broadcast(payload: payload, isKeyframe: false, sequenceNumber: seq)
+                let size = encodeTiledDelta(cur: cur, prev: prev, into: comp)
+                let payload = Data(bytes: comp, count: size)
+                tcpServer.broadcast(payload: payload, isKeyframe: false, sequenceNumber: frameSequence, tiled: true)
+                lastCompressedSize = size
+                tiledFrames += 1
+                sent = true
             }
-            lastCompressedSize = Int(compressedSize)
         }
 
-        let temp = previousGray
-        previousGray = currentGray
-        currentGray = temp
+        if sent {
+            frameSequence &+= 1
+            sentStatFrames += 1
+            // The client now shows `cur` — it becomes the base for the next delta.
+            previousGray = cur
+            currentGray = prev
+        }
 
         let t2 = CACurrentMediaTime()
 
         if wsServer?.hasClients == true {
             let ciImage = CIImage(ioSurface: unsafeBitCast(surface, to: IOSurface.self))
-            let grayImage = ciImage.applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0.0])
+            let grayImage = useColor ? ciImage
+                : ciImage.applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0.0])
             if let jpegData = ciContext.jpegRepresentation(
                 of: grayImage,
                 colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
@@ -511,20 +560,110 @@ class ScreenCapture: NSObject {
 
         let now = Date()
         if now.timeIntervalSince(lastStatTime) >= 5.0 {
-            let fps = Double(statFrames) / now.timeIntervalSince(lastStatTime)
+            // FPS = frames actually delivered to the device (idle callbacks excluded)
+            let fps = Double(sentStatFrames) / now.timeIntervalSince(lastStatTime)
             let avgConvert = statFrames > 0 ? convertTimeSum / Double(statFrames) : 0
             let avgCompress = statFrames > 0 ? compressTimeSum / Double(statFrames) : 0
             let bw = Double(lastCompressedSize) * fps / 1024 / 1024
             let avgJitter = jitterSamples.isEmpty ? 0.0 : jitterSamples.reduce(0, +) / Double(jitterSamples.count)
 
-            print(String(format: "FPS: %.1f | gray: %.1fms | lz4+delta: %.1fms | jitter: %.1fms | frame: %dKB | ~%.1fMB/s | total: %d | skipped: %d",
-                         fps, avgConvert, avgCompress, avgJitter, lastCompressedSize / 1024, bw, frameCount, skippedFrames))
+            print(String(format: "FPS: %.1f | %@: %.1fms | lz4+delta: %.1fms | jitter: %.1fms | frame: %dKB | ~%.1fMB/s | tiled: %d | total: %d | skipped: %d",
+                         fps, useColor ? "rgb" : "grey", avgConvert, avgCompress, avgJitter,
+                         lastCompressedSize / 1024, bw, tiledFrames, frameCount, skippedFrames))
             onStats?(fps, bw, lastCompressedSize / 1024, frameCount, avgConvert, avgCompress, avgJitter, skippedFrames)
 
             statFrames = 0
+            sentStatFrames = 0
+            tiledFrames = 0
             convertTimeSum = 0
             compressTimeSum = 0
             lastStatTime = now
+        }
+    }
+
+    // MARK: - Delta encoding
+
+    /// Compare `cur` and `prev` tile by tile (row memcmp, early exit) and fill
+    /// `dirtyBitmap`. Returns (dirty tiles, total tiles).
+    private func markDirtyTiles(cur: UnsafeMutablePointer<UInt8>, prev: UnsafeMutablePointer<UInt8>) -> (Int, Int) {
+        let bpp = bytesPerPixel
+        let cols = tileCols, rows = tileRows
+        let stride = frameWidth * bpp
+        for i in 0..<dirtyBitmap.count { dirtyBitmap[i] = 0 }
+        var dirty = 0
+        for ty in 0..<rows {
+            let tileH = min(TILE_SIZE, frameHeight - ty * TILE_SIZE)
+            for tx in 0..<cols {
+                let rowLen = min(TILE_SIZE, frameWidth - tx * TILE_SIZE) * bpp
+                var offset = ty * TILE_SIZE * stride + tx * TILE_SIZE * bpp
+                for _ in 0..<tileH {
+                    if memcmp(cur + offset, prev + offset, rowLen) != 0 {
+                        let idx = ty * cols + tx
+                        dirtyBitmap[idx >> 3] |= UInt8(1 << (idx & 7))
+                        dirty += 1
+                        break
+                    }
+                    offset += stride
+                }
+            }
+        }
+        return (dirty, cols * rows)
+    }
+
+    /// Tiled payload: [cols:2][rows:2][bitmap] then, per dirty tile in row-major order,
+    /// [lz4_len:4][LZ4(XOR of the tile's rows, packed)]. Returns the payload size.
+    private func encodeTiledDelta(cur: UnsafeMutablePointer<UInt8>, prev: UnsafeMutablePointer<UInt8>,
+                                  into out: UnsafeMutablePointer<CChar>) -> Int {
+        let bpp = bytesPerPixel
+        let cols = tileCols, rows = tileRows
+        let stride = frameWidth * bpp
+        let raw = UnsafeMutableRawPointer(out)
+        raw.storeBytes(of: UInt16(cols).littleEndian, toByteOffset: 0, as: UInt16.self)
+        raw.storeBytes(of: UInt16(rows).littleEndian, toByteOffset: 2, as: UInt16.self)
+        var pos = 4
+        dirtyBitmap.withUnsafeBytes { bm in
+            (raw + pos).copyMemory(from: bm.baseAddress!, byteCount: bm.count)
+        }
+        pos += dirtyBitmap.count
+
+        guard let scratch = tileDelta else { return pos }
+        for ty in 0..<rows {
+            let tileH = min(TILE_SIZE, frameHeight - ty * TILE_SIZE)
+            for tx in 0..<cols {
+                let idx = ty * cols + tx
+                guard dirtyBitmap[idx >> 3] & UInt8(1 << (idx & 7)) != 0 else { continue }
+                let rowLen = min(TILE_SIZE, frameWidth - tx * TILE_SIZE) * bpp
+                var src = ty * TILE_SIZE * stride + tx * TILE_SIZE * bpp
+                var packed = 0
+                for _ in 0..<tileH {
+                    xorDelta(cur + src, prev + src, into: scratch + packed, count: rowLen)
+                    packed += rowLen
+                    src += stride
+                }
+                let n = LZ4_compress_default(
+                    scratch, out + pos + 4, Int32(packed), Int32(compressedCapacity - pos - 4)
+                )
+                raw.storeBytes(of: UInt32(n).littleEndian, toByteOffset: pos, as: UInt32.self)
+                pos += 4 + Int(n)
+            }
+        }
+        return pos
+    }
+
+    /// out = a XOR b, 16 bytes at a time.
+    @inline(__always)
+    private func xorDelta(_ a: UnsafeMutablePointer<UInt8>, _ b: UnsafeMutablePointer<UInt8>,
+                          into out: UnsafeMutablePointer<UInt8>, count: Int) {
+        var i = 0
+        while i + 16 <= count {
+            let x = UnsafeRawPointer(a + i).loadUnaligned(as: SIMD16<UInt8>.self)
+            let y = UnsafeRawPointer(b + i).loadUnaligned(as: SIMD16<UInt8>.self)
+            UnsafeMutableRawPointer(out + i).storeBytes(of: x ^ y, as: SIMD16<UInt8>.self)
+            i += 16
+        }
+        while i < count {
+            out[i] = a[i] ^ b[i]
+            i += 1
         }
     }
 }

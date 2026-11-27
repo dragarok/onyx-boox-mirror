@@ -1,0 +1,28 @@
+{
+  "label": "wifi",
+  "time": "2026-11-27T09:08:37",
+  "phase_seconds": 15,
+  "phases": {
+    "typing": {
+      "fps": 5.1,
+      "rtt_avg_ms": 61.0,
+      "rtt_p95_ms": 313.6,
+      "bandwidth_mbps": 0.01,
+      "samples": 28
+    },
+    "scrolling": {
+      "fps": 26.6,
+      "rtt_avg_ms": 165.6,
+      "rtt_p95_ms": 529.2,
+      "bandwidth_mbps": 5.56,
+      "samples": 28
+    },
+    "pageflip": {
+      "fps": 9.7,
+      "rtt_avg_ms": 244.9,
+      "rtt_p95_ms": 529.2,
+      "bandwidth_mbps": 4.06,
+      "samples": 27
+    }
+  }
+}

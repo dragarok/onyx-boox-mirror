@@ -550,7 +550,7 @@ struct MirrorMenuView: View {
                 }
                 Spacer()
                 Button("Feedback") {
-                    NSWorkspace.shared.open(URL(string: "https://github.com/welfvh/daylight-mirror/issues")!)
+                    NSWorkspace.shared.open(URL(string: "https://github.com/dragarok/onyx-boox-mirror/issues")!)
                 }
                 .buttonStyle(.plain)
                 .font(.caption)
@@ -615,7 +615,7 @@ struct MirrorMenuView: View {
         case .idle: return "Idle"
         case .waitingForDevice: return "Waiting"
         case .starting: return "Starting"
-        case .running: return hasDC1 ? "DC-1 connected" : "Running"
+        case .running: return hasDC1 ? "DC-1 connected" : (engine.hasBoox ? "BOOX connected" : "Running")
         case .stopping: return "Stopping"
         case .error: return "Error"
         }
@@ -647,12 +647,12 @@ struct MirrorMenuView: View {
                     }
                 )) {
                     Section("Landscape") {
-                        ForEach(DisplayResolution.allCases.filter { !$0.isPortrait }) { res in
+                        ForEach(DisplayResolution.presets(for: .daylightDC1).filter { !$0.isPortrait }) { res in
                             Text("\(res.label) (\(res.rawValue))").tag(res)
                         }
                     }
                     Section("Portrait") {
-                        ForEach(DisplayResolution.allCases.filter { $0.isPortrait }) { res in
+                        ForEach(DisplayResolution.presets(for: .daylightDC1).filter { $0.isPortrait }) { res in
                             Text("\(res.label) (\(res.rawValue))").tag(res)
                         }
                     }
@@ -679,8 +679,13 @@ struct MirrorMenuView: View {
             }
         }
 
-        // DC-1 display controls (brightness, warmth)
-        if hasDC1 {
+        if engine.hasBoox {
+            if hasDC1 { Divider() }
+            booxControls(running: true)
+        }
+
+        // Display light controls (DC-1 backlight, BOOX frontlight + warm light)
+        if hasDC1 || engine.hasBoox {
             Divider()
 
             // Brightness slider (quadratic curve with widened low-end zone)
@@ -906,10 +911,10 @@ struct MirrorMenuView: View {
                 .frame(width: 16)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(session.device.deviceFamily.rawValue)
+                Text(session.device.displayName)
                     .font(.caption.weight(.medium))
                 HStack(spacing: 4) {
-                    Text(session.resolution.rawValue)
+                    Text("\(session.resolution.label) \(session.resolution.displaySize)")
                     Text("·")
                     Text(session.displayMode == .mirror ? "Mirror" : "Extended")
                 }
@@ -946,7 +951,7 @@ struct MirrorMenuView: View {
                     .font(.title3)
                     .foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Connect your Daylight")
+                    Text("Connect your Daylight or BOOX")
                         .font(.callout.weight(.medium))
                     Text("Plug in a USB-C cable to start mirroring automatically")
                         .font(.caption)
@@ -995,18 +1000,27 @@ struct MirrorMenuView: View {
 
     // MARK: - Idle View
 
+    private var idleShowsDC1: Bool {
+        engine.attachedFamilies.isEmpty || engine.attachedFamilies.contains(.daylightDC1)
+    }
+
     @ViewBuilder
     var idleView: some View {
+        if engine.attachedFamilies.contains(.boox) {
+            booxControls(running: false)
+            Divider()
+        }
         // Resolution picker + mode (matches running view layout)
+        if idleShowsDC1 {
         HStack(spacing: 6) {
             Picker("", selection: $engine.resolution) {
                 Section("Landscape") {
-                    ForEach(DisplayResolution.allCases.filter { !$0.isPortrait }) { res in
+                    ForEach(DisplayResolution.presets(for: .daylightDC1).filter { !$0.isPortrait }) { res in
                         Text("\(res.label) (\(res.rawValue))").tag(res)
                     }
                 }
                 Section("Portrait") {
-                    ForEach(DisplayResolution.allCases.filter { $0.isPortrait }) { res in
+                    ForEach(DisplayResolution.presets(for: .daylightDC1).filter { $0.isPortrait }) { res in
                         Text("\(res.label) (\(res.rawValue))").tag(res)
                     }
                 }
@@ -1026,6 +1040,7 @@ struct MirrorMenuView: View {
         }
 
         Divider()
+        }
 
         // Settings — match running view layout
         HStack {
@@ -1055,6 +1070,8 @@ struct MirrorMenuView: View {
 
         clamshellToggle(confirmState: $showClamshellConfirmIdle)
 
+        wirelessToggle
+
         Divider()
 
         Button(action: {
@@ -1069,6 +1086,104 @@ struct MirrorMenuView: View {
         }
         .buttonStyle(.borderedProminent)
         .controlSize(.regular)
+    }
+
+    /// Wi-Fi streaming switch (shown in the idle settings and in the running BOOX controls).
+    @ViewBuilder
+    var wirelessToggle: some View {
+        HStack {
+            Label {
+                Text(engine.wirelessEnabled && !engine.lanAddresses.isEmpty
+                     ? "Wireless (\(engine.lanAddresses.first!))" : "Wireless (same Wi-Fi)")
+            } icon: {
+                Image(systemName: "wifi").frame(width: 14, alignment: .center)
+            }
+            .font(.caption)
+            Spacer()
+            Toggle("", isOn: $engine.wirelessEnabled)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+        }
+        .help("Lets the BOOX find this Mac over Wi-Fi and start mirroring from the tablet (pair by plugging in once). USB is used whenever connected. On a power adapter the Mac stays awake so the BOOX can reach it; the screen still sleeps.")
+    }
+
+    // MARK: - BOOX Controls
+
+    /// BOOX preset, color, e-ink waveform and refresh. Preset/color changes restart a
+    /// running mirror (new virtual display); e-ink mode applies live.
+    @ViewBuilder
+    func booxControls(running: Bool) -> some View {
+        HStack(spacing: 6) {
+            Picker("", selection: Binding(
+                get: { engine.booxResolution },
+                set: { engine.applyBooxSettings(resolution: $0) }
+            )) {
+                Section("BOOX Landscape") {
+                    ForEach(DisplayResolution.presets(for: .boox).filter { !$0.isPortrait }) { res in
+                        Text("\(res.label) (\(res.displaySize))").tag(res)
+                    }
+                }
+                Section("BOOX Portrait") {
+                    ForEach(DisplayResolution.presets(for: .boox).filter { $0.isPortrait }) { res in
+                        Text("\(res.label) (\(res.displaySize))").tag(res)
+                    }
+                }
+            }
+            .pickerStyle(.menu)
+            .controlSize(.small)
+            .labelsHidden()
+
+            Toggle(isOn: Binding(
+                get: { engine.booxColor },
+                set: { engine.applyBooxSettings(color: $0) }
+            )) {
+                Image(systemName: engine.booxColor ? "paintpalette.fill" : "circle.lefthalf.filled")
+            }
+            .toggleStyle(.button)
+            .controlSize(.small)
+            .help(engine.booxColor ? "Color (Kaleido) — click for greyscale" : "Greyscale — click for color")
+        }
+
+        // Mirror = same picture on both screens (the Mac takes the BOOX's shape);
+        // Extend = the BOOX is a second monitor and the Mac screen is left alone.
+        Picker("", selection: Binding(
+            get: { engine.displayMode },
+            set: { newMode in
+                guard newMode != engine.displayMode else { return }
+                engine.displayMode = newMode
+                if running { restartEngine() }
+            }
+        )) {
+            Text("Mirror Mac").tag(DisplayMode.mirror)
+            Text("Second monitor").tag(DisplayMode.extended)
+        }
+        .pickerStyle(.segmented)
+        .controlSize(.small)
+        .labelsHidden()
+        .help("Mirror shows your Mac screen on the BOOX; Second monitor gives the BOOX its own desktop")
+
+        if running { wirelessToggle }
+
+        HStack(spacing: 6) {
+            Picker("", selection: $engine.einkMode) {
+                ForEach(EinkMode.allCases, id: \.self) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+            .labelsHidden()
+            .help("Auto: fast waveform while things move, clean redraw once they settle")
+
+            if running {
+                Button(action: { engine.refreshScreen() }) {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .controlSize(.small)
+                .help("Full e-ink refresh — clears ghosting (Ctrl+F5)")
+            }
+        }
     }
 
     // MARK: - Clamshell Toggle (inline confirmation)

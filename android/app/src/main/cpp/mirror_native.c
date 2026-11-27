@@ -1,12 +1,16 @@
-// mirror_native.c — Daylight Mirror native renderer.
+// mirror_native.c — Daylight/BOOX Mirror native renderer.
 //
-// Receives LZ4+delta compressed greyscale frames over TCP,
-// decompresses, applies delta, and writes directly to ANativeWindow.
-// Entire hot path is C — no JNI calls, no Java GC, no GPU.
+// Receives LZ4+delta compressed frames over TCP (greyscale 1 B/px or RGB 3 B/px),
+// decompresses, applies the delta, and renders via a GL texture (CPU blit fallback).
+// Entire hot path is C — no JNI calls per frame, no Java GC.
 //
-// Protocol: [0xDA 0x7E] [flags:1B] [seq:4B LE] [length:4B LE] [LZ4 payload]
-//   flags bit 0: 1=keyframe, 0=delta (XOR with previous)
-// ACK:      [0xDA 0x7A] [seq:4B LE] — sent back after rendering each frame
+// Protocol: [0xDA 0x7E] [flags:1B] [seq:4B LE] [length:4B LE] [payload]
+//   flags 0x01: keyframe — payload is LZ4(frame)
+//   flags 0x02: tiled delta — [cols:2][rows:2][dirty bitmap] + per dirty tile
+//               [lz4_len:4][LZ4(XOR of the tile's rows)] (64x64 tiles, row-major)
+//   flags 0x00: full-frame delta — payload is LZ4(frame XOR previous)
+// Commands: [0xDA 0x7F] [cmd:1B] [value...] — see CMD_* below.
+// ACK:      [0xDA 0x7A] [seq:4B LE] — sent back after decoding each frame
 
 #include <jni.h>
 #include <android/native_window.h>
@@ -16,7 +20,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -45,9 +51,15 @@
 #define MAGIC_CMD_1   0x7F
 #define MAGIC_ACK_1   0x7A
 #define FLAG_KEYFRAME 0x01
+#define FLAG_TILED    0x02
 #define FRAME_HEADER_SIZE 11
+#define TILE_SIZE 64
 #define CMD_BRIGHTNESS 0x01
+#define CMD_WARMTH     0x02
 #define CMD_RESOLUTION 0x04
+#define CMD_COLOR_MODE 0x05
+#define CMD_REFRESH    0x06
+#define CMD_EINK_MODE  0x07
 
 // Global state
 static ANativeWindow *g_window = NULL;
@@ -59,6 +71,21 @@ static jobject g_activity = NULL;
 static char g_host[64] = "127.0.0.1";
 static int g_port = 8888;
 static int g_sock = -1;
+// Set by nativeSwitchToUSB(): drop the Wi-Fi stream and reconnect through the USB tunnel
+// without blanking the panel.
+static volatile int g_switching = 0;
+
+// Connection candidates, tried in order: the USB tunnel (127.0.0.1) first, then Mac
+// addresses on Wi-Fi (handed over by the Mac via USB, or found by Bonjour). Non-loopback
+// connections start with an auth packet carrying the pairing secret.
+#define MAX_HOSTS 8
+#define AUTH_TOKEN_LEN 16
+static char g_hosts[MAX_HOSTS][64] = {"127.0.0.1"};
+static int g_host_count = 1;
+static int g_host_index = 0;
+static pthread_mutex_t g_host_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t g_token[AUTH_TOKEN_LEN];
+static int g_has_token = 0;
 
 // Dynamic frame dimensions (set by CMD_RESOLUTION before first frame)
 static uint32_t g_frame_w = DEFAULT_FRAME_W;
@@ -69,7 +96,12 @@ static uint32_t g_frame_h = DEFAULT_FRAME_H;
 static uint32_t g_surface_w = 0;
 static uint32_t g_surface_h = 0;
 static uint32_t g_pixel_count = DEFAULT_FRAME_W * DEFAULT_FRAME_H;
+// Bytes per pixel: 1 = greyscale, 3 = RGB (set by CMD_COLOR_MODE before CMD_RESOLUTION)
+static uint32_t g_bpp = 1;
+static uint32_t g_buffer_size = DEFAULT_FRAME_W * DEFAULT_FRAME_H;  // g_pixel_count * g_bpp
 static uint32_t g_max_compressed = DEFAULT_FRAME_W * DEFAULT_FRAME_H + (DEFAULT_FRAME_W * DEFAULT_FRAME_H / 255) + 1024;
+// Monotonic ms of the last decoded frame — polled by Kotlin for e-ink auto mode.
+static volatile int64_t g_last_frame_ms = 0;
 
 // Frame buffers (allocated once, reused — reallocated on resolution change)
 static uint8_t *g_current_frame = NULL;   // Decompressed greyscale pixels
@@ -97,6 +129,7 @@ static GLint g_gl_attr_texcoord = -1;
 static GLint g_gl_uniform_texture = -1;
 static uint32_t g_gl_tex_w = 0;
 static uint32_t g_gl_tex_h = 0;
+static uint32_t g_gl_tex_bpp = 0;
 static int g_gl_ready = 0;
 static int g_gl_rotated = 0;  // 1 = currently using rotated quad vertices
 
@@ -129,7 +162,9 @@ static const char *k_vertex_shader_src =
     "    v_texcoord = a_texcoord;\n"
     "}\n";
 
-// Fragment shader — passthrough.  All image processing (greyscale, sharpen,
+// Fragment shader — passthrough.  Sampling .rgb works for both texture formats:
+// a GL_LUMINANCE texel reads back as (L, L, L), a GL_RGB texel as (R, G, B).
+// All image processing (greyscale, sharpen,
 // contrast, gamma) is done Mac-side in the combined LUT.  An earlier version
 // applied smoothstep(0.08, 0.92) here to snap antialiasing fringes to B/W,
 // but combined with the Mac-side gamma+contrast LUT it crushed light greys
@@ -141,8 +176,7 @@ static const char *k_fragment_shader_src =
     "varying vec2 v_texcoord;\n"
     "uniform sampler2D u_texture;\n"
     "void main() {\n"
-    "    float grey = texture2D(u_texture, v_texcoord).r;\n"
-    "    gl_FragColor = vec4(grey, grey, grey, 1.0);\n"
+    "    gl_FragColor = vec4(texture2D(u_texture, v_texcoord).rgb, 1.0);\n"
     "}\n";
 
 static void gl_teardown(void);
@@ -218,7 +252,9 @@ static int gl_create_program(void) {
     return 1;
 }
 
-static int gl_create_texture(uint32_t width, uint32_t height) {
+static GLenum gl_format_for_bpp(uint32_t bpp) { return bpp == 3 ? GL_RGB : GL_LUMINANCE; }
+
+static int gl_create_texture(uint32_t width, uint32_t height, uint32_t bpp) {
     if (g_gl_texture) {
         glDeleteTextures(1, &g_gl_texture);
         g_gl_texture = 0;
@@ -237,11 +273,12 @@ static int gl_create_texture(uint32_t width, uint32_t height) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, (GLsizei)width, (GLsizei)height,
-                 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+    GLenum fmt = gl_format_for_bpp(bpp);
+    glTexImage2D(GL_TEXTURE_2D, 0, fmt, (GLsizei)width, (GLsizei)height,
+                 0, fmt, GL_UNSIGNED_BYTE, NULL);
 
     if (glGetError() != GL_NO_ERROR) {
-        LOGE("glTexImage2D failed for %ux%u", width, height);
+        LOGE("glTexImage2D failed for %ux%u (%s)", width, height, bpp == 3 ? "RGB" : "LUMINANCE");
         glDeleteTextures(1, &g_gl_texture);
         g_gl_texture = 0;
         return 0;
@@ -249,6 +286,7 @@ static int gl_create_texture(uint32_t width, uint32_t height) {
 
     g_gl_tex_w = width;
     g_gl_tex_h = height;
+    g_gl_tex_bpp = bpp;
     return 1;
 }
 
@@ -321,7 +359,7 @@ static int gl_init(ANativeWindow *window) {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     g_gl_rotated = 0;
 
-    if (!gl_create_texture(g_frame_w, g_frame_h)) goto fail;
+    if (!gl_create_texture(g_frame_w, g_frame_h, g_bpp)) goto fail;
 
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     g_gl_ready = 1;
@@ -332,10 +370,10 @@ fail:
     return 0;
 }
 
-static int gl_ensure_texture_size(uint32_t width, uint32_t height) {
+static int gl_ensure_texture_size(uint32_t width, uint32_t height, uint32_t bpp) {
     if (!g_gl_ready) return 0;
-    if (g_gl_texture && g_gl_tex_w == width && g_gl_tex_h == height) return 1;
-    return gl_create_texture(width, height);
+    if (g_gl_texture && g_gl_tex_w == width && g_gl_tex_h == height && g_gl_tex_bpp == bpp) return 1;
+    return gl_create_texture(width, height, bpp);
 }
 
 static void gl_teardown(void) {
@@ -378,6 +416,7 @@ static void gl_teardown(void) {
     g_gl_uniform_texture = -1;
     g_gl_tex_w = 0;
     g_gl_tex_h = 0;
+    g_gl_tex_bpp = 0;
     g_gl_ready = 0;
 }
 
@@ -492,6 +531,33 @@ static double ms_diff(struct timespec a, struct timespec b) {
     return ((b.tv_sec - a.tv_sec) * 1000.0) + ((b.tv_nsec - a.tv_nsec) / 1e6);
 }
 
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Call a void Java method on the activity: no args ("()V") or one int ("(I)V").
+static void call_activity(const char *name, int has_arg, int value) {
+    if (!g_jvm || !g_activity) return;
+    JNIEnv *env;
+    int attached = 0;
+    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        (*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL);
+        attached = 1;
+    }
+    jclass cls = (*env)->GetObjectClass(env, g_activity);
+    jmethodID mid = (*env)->GetMethodID(env, cls, name, has_arg ? "(I)V" : "()V");
+    if (mid) {
+        if (has_arg) (*env)->CallVoidMethod(env, g_activity, mid, (jint)value);
+        else (*env)->CallVoidMethod(env, g_activity, mid);
+    } else {
+        (*env)->ExceptionClear(env);
+        LOGE("Activity method %s not found", name);
+    }
+    if (attached) (*g_jvm)->DetachCurrentThread(g_jvm);
+}
+
 static void notify_connection_state(int connected) {
     if (!g_jvm || !g_activity) return;
     JNIEnv *env;
@@ -512,7 +578,7 @@ static void publish_frame(const uint8_t *frame, uint32_t seq) {
 
     const int write_index = (g_ready_index == 0) ? 1 : 0;
     if (g_render_frames[write_index]) {
-        memcpy(g_render_frames[write_index], frame, g_pixel_count);
+        memcpy(g_render_frames[write_index], frame, g_buffer_size);
         if (g_has_ready_frame) g_overwritten_frames += 1;
         g_ready_index = write_index;
         g_ready_seq = seq;
@@ -522,17 +588,19 @@ static void publish_frame(const uint8_t *frame, uint32_t seq) {
     pthread_mutex_unlock(&g_frame_mutex);
 }
 
-static int reallocate_buffers(uint32_t new_w, uint32_t new_h, uint8_t **decompress_buf) {
+static int reallocate_buffers(uint32_t new_w, uint32_t new_h, uint32_t new_bpp, uint8_t **decompress_buf) {
     uint32_t new_pixels = new_w * new_h;
-    // LZ4 worst-case: input_size + input_size/255 + 16. Use generous margin
-    // to handle incompressible frames (noisy screenshots, gradients, etc.).
-    uint32_t new_max_compressed = new_pixels + (new_pixels / 255) + 1024;
+    uint32_t new_size = new_pixels * new_bpp;
+    // LZ4 worst-case: input_size + input_size/255 + 16. Tiled payloads add a header,
+    // bitmap and a 4-byte length per tile; use a generous margin for both.
+    uint32_t tiles = ((new_w + TILE_SIZE - 1) / TILE_SIZE) * ((new_h + TILE_SIZE - 1) / TILE_SIZE);
+    uint32_t new_max_compressed = new_size + (new_size / 255) + tiles * 24 + 4096;
 
-    uint8_t *new_current = (uint8_t *)calloc(new_pixels, 1);
+    uint8_t *new_current = (uint8_t *)calloc(new_size, 1);
     uint8_t *new_compressed = (uint8_t *)malloc(new_max_compressed);
-    uint8_t *new_decompress = (uint8_t *)malloc(new_pixels);
-    uint8_t *new_render0 = (uint8_t *)malloc(new_pixels);
-    uint8_t *new_render1 = (uint8_t *)malloc(new_pixels);
+    uint8_t *new_decompress = (uint8_t *)malloc(new_size);
+    uint8_t *new_render0 = (uint8_t *)malloc(new_size);
+    uint8_t *new_render1 = (uint8_t *)malloc(new_size);
 
     if (!new_current || !new_compressed || !new_decompress || !new_render0 || !new_render1) {
         free(new_current);
@@ -555,16 +623,75 @@ static int reallocate_buffers(uint32_t new_w, uint32_t new_h, uint8_t **decompre
     *decompress_buf = new_decompress;
     g_render_frames[0] = new_render0;
     g_render_frames[1] = new_render1;
-    memset(g_render_frames[0], 0xFF, new_pixels);
-    memset(g_render_frames[1], 0xFF, new_pixels);
+    memset(g_render_frames[0], 0xFF, new_size);
+    memset(g_render_frames[1], 0xFF, new_size);
     g_ready_index = 0;
     g_has_ready_frame = 0;
 
     g_frame_w = new_w;
     g_frame_h = new_h;
+    g_bpp = new_bpp;
     g_pixel_count = new_pixels;
+    g_buffer_size = new_size;
     g_max_compressed = new_max_compressed;
     pthread_mutex_unlock(&g_frame_mutex);
+    return 1;
+}
+
+// Apply a tiled delta payload to g_current_frame. Returns 0 on a malformed payload.
+static int apply_tiled_delta(const uint8_t *payload, uint32_t payload_len, uint8_t *scratch) {
+    if (payload_len < 4) return 0;
+    const uint8_t *p = payload;
+    const uint8_t *end = payload + payload_len;
+    uint32_t cols = p[0] | (p[1] << 8);
+    uint32_t rows = p[2] | (p[3] << 8);
+    p += 4;
+    uint32_t expect_cols = (g_frame_w + TILE_SIZE - 1) / TILE_SIZE;
+    uint32_t expect_rows = (g_frame_h + TILE_SIZE - 1) / TILE_SIZE;
+    if (cols != expect_cols || rows != expect_rows) {
+        LOGE("Tiled frame grid %ux%u does not match %ux%u", cols, rows, expect_cols, expect_rows);
+        return 0;
+    }
+    uint32_t tile_count = cols * rows;
+    uint32_t bitmap_bytes = (tile_count + 7) / 8;
+    if ((uint32_t)(end - p) < bitmap_bytes) return 0;
+    const uint8_t *bitmap = p;
+    p += bitmap_bytes;
+
+    const int bpp = (int)g_bpp;
+    const int stride = (int)g_frame_w * bpp;
+    const int tile_max = TILE_SIZE * TILE_SIZE * bpp;
+    for (uint32_t ty = 0; ty < rows; ty++) {
+        int tile_h = TILE_SIZE;
+        if ((int)(ty * TILE_SIZE) + tile_h > (int)g_frame_h) tile_h = (int)g_frame_h - (int)(ty * TILE_SIZE);
+        for (uint32_t tx = 0; tx < cols; tx++) {
+            uint32_t idx = ty * cols + tx;
+            if (!(bitmap[idx >> 3] & (1 << (idx & 7)))) continue;
+            int tile_w = TILE_SIZE;
+            if ((int)(tx * TILE_SIZE) + tile_w > (int)g_frame_w) tile_w = (int)g_frame_w - (int)(tx * TILE_SIZE);
+
+            if (end - p < 4) return 0;
+            uint32_t comp_len = p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
+            p += 4;
+            if ((uint32_t)(end - p) < comp_len) return 0;
+
+            const int row_len = tile_w * bpp;
+            const int tile_bytes = row_len * tile_h;
+            int got = LZ4_decompress_safe((const char *)p, (char *)scratch, (int)comp_len, tile_max);
+            p += comp_len;
+            if (got != tile_bytes) {
+                LOGE("Tile %u LZ4 failed: got %d, expected %d", idx, got, tile_bytes);
+                return 0;
+            }
+            uint8_t *dst = g_current_frame + (size_t)ty * TILE_SIZE * stride + (size_t)tx * TILE_SIZE * bpp;
+            const uint8_t *src = scratch;
+            for (int r = 0; r < tile_h; r++) {
+                apply_delta_neon(dst, src, row_len);
+                dst += stride;
+                src += row_len;
+            }
+        }
+    }
     return 1;
 }
 
@@ -587,7 +714,8 @@ static void *render_thread(void *arg) {
         }
 
         const int frame_index = g_ready_index;
-        uint32_t local_pixels = g_pixel_count;
+        uint32_t local_pixels = g_buffer_size;  // bytes, not pixels (RGB = 3 B/px)
+        uint32_t render_bpp = g_bpp;
         render_w = g_frame_w;
         render_h = g_frame_h;
 
@@ -616,7 +744,7 @@ static void *render_thread(void *arg) {
                     gl_disabled = 1;
                 }
 
-                if (g_gl_ready && !gl_ensure_texture_size(render_w, render_h)) {
+                if (g_gl_ready && !gl_ensure_texture_size(render_w, render_h, render_bpp)) {
                     LOGE("GL texture resize failed for %ux%u", render_w, render_h);
                     gl_teardown();
                     gl_disabled = 1;
@@ -627,9 +755,6 @@ static void *render_thread(void *arg) {
                     EGLint surface_h = 0;
                     eglQuerySurface(g_egl_display, g_egl_surface, EGL_WIDTH, &surface_w);
                     eglQuerySurface(g_egl_display, g_egl_surface, EGL_HEIGHT, &surface_h);
-                    if (surface_w > 0 && surface_h > 0) {
-                        glViewport(0, 0, surface_w, surface_h);
-                    }
 
                     // Detect orientation mismatch using actual surface dimensions
                     // (from surfaceChanged). Some devices report rotation=LANDSCAPE
@@ -637,6 +762,28 @@ static void *render_thread(void *arg) {
                     int frame_is_landscape = (render_w > render_h) ? 1 : 0;
                     int surface_is_landscape = (g_surface_w > g_surface_h) ? 1 : 0;
                     int need_rotation = (g_surface_w > 0 && frame_is_landscape != surface_is_landscape) ? 1 : 0;
+
+                    // Aspect-fit: never stretch. If the frame's aspect differs from the
+                    // surface (e.g. firmware reserves part of the panel), center it and
+                    // leave white bars — white is "off" on paper-like panels.
+                    if (surface_w > 0 && surface_h > 0) {
+                        double fw = need_rotation ? (double)render_h : (double)render_w;
+                        double fh = need_rotation ? (double)render_w : (double)render_h;
+                        double scale = (double)surface_w / fw;
+                        if ((double)surface_h / fh < scale) scale = (double)surface_h / fh;
+                        GLint vw = (GLint)(fw * scale + 0.5);
+                        GLint vh = (GLint)(fh * scale + 0.5);
+                        if (vw > surface_w) vw = surface_w;
+                        if (vh > surface_h) vh = surface_h;
+                        GLint vx = (surface_w - vw) / 2;
+                        GLint vy = (surface_h - vh) / 2;
+                        if (vw != surface_w || vh != surface_h) {
+                            glViewport(0, 0, surface_w, surface_h);
+                            glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+                            glClear(GL_COLOR_BUFFER_BIT);
+                        }
+                        glViewport(vx, vy, vw, vh);
+                    }
                     if (need_rotation != g_gl_rotated) {
                         g_gl_rotated = need_rotation;
                         glBindBuffer(GL_ARRAY_BUFFER, g_gl_vbo);
@@ -667,7 +814,7 @@ static void *render_thread(void *arg) {
                     clock_gettime(CLOCK_MONOTONIC, &t4a);
                     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
                                     (GLsizei)render_w, (GLsizei)render_h,
-                                    GL_LUMINANCE, GL_UNSIGNED_BYTE, render_local);
+                                    gl_format_for_bpp(render_bpp), GL_UNSIGNED_BYTE, render_local);
                     glDrawArrays(GL_TRIANGLES, 0, 6);
                     clock_gettime(CLOCK_MONOTONIC, &t4b);
 
@@ -705,15 +852,35 @@ static void *render_thread(void *arg) {
                             uint8_t *row = dst + sy * dst_stride;
                             for (int sx = 0; sx < out_w; sx++) {
                                 // Screen (sx,sy) → frame (sy, fh-1-sx)
-                                uint8_t v = render_local[((fh - 1 - sx) * fw) + sy];
-                                row[sx * 4 + 0] = v;
-                                row[sx * 4 + 1] = v;
-                                row[sx * 4 + 2] = v;
+                                const uint8_t *px = render_local + (((size_t)(fh - 1 - sx) * fw) + sy) * render_bpp;
+                                row[sx * 4 + 0] = px[0];
+                                row[sx * 4 + 1] = px[render_bpp == 3 ? 1 : 0];
+                                row[sx * 4 + 2] = px[render_bpp == 3 ? 2 : 0];
                                 row[sx * 4 + 3] = 0xFF;
                             }
                         }
                     } else {
-                        for (int y = 0; y < fh && y < nbuf.height; y++) {
+                        for (int y = 0; y < fh && y < nbuf.height && render_bpp == 3; y++) {
+                            uint8_t *row = dst + y * dst_stride;
+                            const uint8_t *row_src = render_local + (size_t)y * fw * 3;
+                            int x = 0;
+                            for (; x + 16 <= fw && x + 16 <= nbuf.width; x += 16) {
+                                uint8x16x3_t rgb = vld3q_u8(row_src + x * 3);
+                                uint8x16x4_t rgbx;
+                                rgbx.val[0] = rgb.val[0];
+                                rgbx.val[1] = rgb.val[1];
+                                rgbx.val[2] = rgb.val[2];
+                                rgbx.val[3] = vdupq_n_u8(0xFF);
+                                vst4q_u8(row + x * 4, rgbx);
+                            }
+                            for (; x < fw && x < nbuf.width; x++) {
+                                row[x * 4 + 0] = row_src[x * 3 + 0];
+                                row[x * 4 + 1] = row_src[x * 3 + 1];
+                                row[x * 4 + 2] = row_src[x * 3 + 2];
+                                row[x * 4 + 3] = 0xFF;
+                            }
+                        }
+                        for (int y = 0; y < fh && y < nbuf.height && render_bpp == 1; y++) {
                             uint8_t *row = dst + y * dst_stride;
                             const uint8_t *row_src = render_local + y * fw;
                             int x = 0;
@@ -758,24 +925,85 @@ static void *render_thread(void *arg) {
     return NULL;
 }
 
+static int is_loopback_host(const char *host) {
+    return strncmp(host, "127.", 4) == 0 || strcmp(host, "localhost") == 0;
+}
+
+/// TCP connect with a timeout so an unreachable Wi-Fi address can't stall the loop
+/// (a blocking connect waits ~75 s). Returns 0 on success.
+static int connect_with_timeout(int sock, const struct sockaddr_in *addr, int timeout_ms) {
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    int rc = connect(sock, (const struct sockaddr *)addr, sizeof(*addr));
+    if (rc < 0 && errno == EINPROGRESS) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(sock, &wfds);
+        struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+        rc = select(sock + 1, NULL, &wfds, NULL, &tv);
+        if (rc == 1) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
+            if (err == 0) rc = 0; else { errno = err; rc = -1; }
+        } else {
+            if (rc == 0) errno = ETIMEDOUT;
+            rc = -1;
+        }
+    }
+    fcntl(sock, F_SETFL, flags);
+    return rc;
+}
+
+/// Tell Kotlin which host the stream reached (touch/keyboard connect to the same one).
+static void notify_connected_host(const char *host) {
+    if (!g_jvm || !g_activity) return;
+    JNIEnv *env;
+    int attached = 0;
+    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        (*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL);
+        attached = 1;
+    }
+    jclass cls = (*env)->GetObjectClass(env, g_activity);
+    jmethodID mid = (*env)->GetMethodID(env, cls, "onConnectedHost", "(Ljava/lang/String;)V");
+    if (mid) {
+        jstring js = (*env)->NewStringUTF(env, host);
+        (*env)->CallVoidMethod(env, g_activity, mid, js);
+        (*env)->DeleteLocalRef(env, js);
+    } else {
+        (*env)->ExceptionClear(env);
+    }
+    if (attached) (*g_jvm)->DetachCurrentThread(g_jvm);
+}
+
 static void *decode_thread(void *arg) {
     (void)arg;
     LOGI("Decode thread started, connecting to %s:%d", g_host, g_port);
 
-    g_current_frame = (uint8_t *)calloc(g_pixel_count, 1);
+    g_current_frame = (uint8_t *)calloc(g_buffer_size, 1);
     g_compressed_buf = (uint8_t *)malloc(g_max_compressed);
-    uint8_t *decompress_buf = (uint8_t *)malloc(g_pixel_count);
-    g_render_frames[0] = (uint8_t *)malloc(g_pixel_count);
-    g_render_frames[1] = (uint8_t *)malloc(g_pixel_count);
+    uint8_t *decompress_buf = (uint8_t *)malloc(g_buffer_size);
+    g_render_frames[0] = (uint8_t *)malloc(g_buffer_size);
+    g_render_frames[1] = (uint8_t *)malloc(g_buffer_size);
 
     if (!g_current_frame || !g_compressed_buf || !decompress_buf || !g_render_frames[0] || !g_render_frames[1]) {
         LOGE("Failed to allocate buffers");
         goto cleanup;
     }
-    memset(g_render_frames[0], 0xFF, g_pixel_count);
-    memset(g_render_frames[1], 0xFF, g_pixel_count);
+    memset(g_render_frames[0], 0xFF, g_buffer_size);
+    memset(g_render_frames[1], 0xFF, g_buffer_size);
 
+    int failed_in_cycle = 0;
     while (g_running) {
+        // Pick the next candidate host
+        pthread_mutex_lock(&g_host_mutex);
+        if (g_host_index >= g_host_count) g_host_index = 0;
+        strncpy(g_host, g_hosts[g_host_index], sizeof(g_host) - 1);
+        g_host[sizeof(g_host) - 1] = 0;
+        int host_count = g_host_count;
+        pthread_mutex_unlock(&g_host_mutex);
+        const int loopback = is_loopback_host(g_host);
+
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
             LOGE("socket() failed: %s", strerror(errno));
@@ -790,23 +1018,51 @@ static void *decode_thread(void *arg) {
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         addr.sin_port = htons(g_port);
-        inet_pton(AF_INET, g_host, &addr.sin_addr);
-
-        LOGI("Connecting to %s:%d ...", g_host, g_port);
-        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            LOGE("connect() failed: %s (is ADB reverse tunnel set up?)", strerror(errno));
+        if (inet_pton(AF_INET, g_host, &addr.sin_addr) != 1) {
+            LOGE("Bad host address: %s", g_host);
             close(sock);
-            sleep(1);
+            pthread_mutex_lock(&g_host_mutex); g_host_index++; pthread_mutex_unlock(&g_host_mutex);
             continue;
         }
 
+        if (connect_with_timeout(sock, &addr, loopback ? 500 : 1500) < 0) {
+            close(sock);
+            pthread_mutex_lock(&g_host_mutex); g_host_index++; pthread_mutex_unlock(&g_host_mutex);
+            // Pause once every candidate has failed; move straight on otherwise
+            if (++failed_in_cycle >= host_count) {
+                failed_in_cycle = 0;
+                sleep(1);
+            }
+            continue;
+        }
+        failed_in_cycle = 0;
+
+        // Network (non-USB) connections must prove they're paired before the Mac streams
+        if (!loopback) {
+            if (!g_has_token) {
+                LOGE("No pairing secret for %s — connect over USB once to pair", g_host);
+                close(sock);
+                pthread_mutex_lock(&g_host_mutex); g_host_index++; pthread_mutex_unlock(&g_host_mutex);
+                sleep(1);
+                continue;
+            }
+            uint8_t auth[2 + AUTH_TOKEN_LEN] = { 0xDA, 0x75 };
+            memcpy(auth + 2, g_token, AUTH_TOKEN_LEN);
+            if (send(sock, auth, sizeof(auth), MSG_NOSIGNAL) != (ssize_t)sizeof(auth)) {
+                close(sock);
+                continue;
+            }
+        }
+
         g_sock = sock;
-        LOGI("Connected to server %s:%d", g_host, g_port);
+        LOGI("Connected to server %s:%d (%s)", g_host, g_port, loopback ? "USB" : "Wi-Fi");
+        notify_connected_host(g_host);
+        int received_any = 0;
 
         int frame_count = 0;
         int stat_frames = 0;
         int dropped_frames = 0;
-        int skipped_deltas = 0;
+        int tiled_frames = 0;
         uint32_t last_seq = 0;
         int has_last_seq = 0;
         double recv_sum = 0, decomp_sum = 0, delta_sum = 0;
@@ -822,6 +1078,7 @@ static void *decode_thread(void *arg) {
                 LOGE("Connection lost");
                 break;
             }
+            received_any = 1;
             if (magic[0] != MAGIC_FRAME_0) {
                 LOGE("Bad magic: 0x%02x 0x%02x", magic[0], magic[1]);
                 break;
@@ -837,12 +1094,14 @@ static void *decode_thread(void *arg) {
                     uint32_t new_w = res_data[0] | (res_data[1] << 8);
                     uint32_t new_h = res_data[2] | (res_data[3] << 8);
                     if (new_w > 0 && new_h > 0 && new_w <= 4096 && new_h <= 4096) {
-                        if (reallocate_buffers(new_w, new_h, &decompress_buf)) {
+                        if (reallocate_buffers(new_w, new_h, g_bpp, &decompress_buf)) {
                             if (g_window) {
                                 ANativeWindow_setBuffersGeometry(g_window, new_w, new_h,
                                     AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM);
                             }
-                            LOGI("Resolution → %ux%u (%u pixels)", new_w, new_h, g_pixel_count);
+                            LOGI("Resolution → %ux%u (%u pixels, %u B/px)", new_w, new_h, g_pixel_count, g_bpp);
+                            // Kotlin maps touches through the same aspect-fit rect
+                            call_activity("onFrameSize", 1, (int)((new_w << 16) | new_h));
 
                             // Notify Activity to switch orientation for portrait/landscape
                             if (g_jvm && g_activity) {
@@ -867,24 +1126,26 @@ static void *decode_thread(void *arg) {
                     continue;
                 }
 
+                // Every other command carries exactly one value byte.
                 uint8_t value;
                 if (read_exact(sock, &value, 1) < 0) break;
-                if (g_jvm && g_activity) {
-                    JNIEnv *env;
-                    int attached = 0;
-                    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
-                        (*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL);
-                        attached = 1;
+                switch (cmd) {
+                case CMD_COLOR_MODE: {
+                    uint32_t new_bpp = value ? 3 : 1;
+                    if (new_bpp != g_bpp) {
+                        if (reallocate_buffers(g_frame_w, g_frame_h, new_bpp, &decompress_buf)) {
+                            LOGI("Pixel format → %s", new_bpp == 3 ? "RGB" : "greyscale");
+                        } else {
+                            LOGE("Pixel format change allocation failed");
+                        }
                     }
-                    jclass cls = (*env)->GetObjectClass(env, g_activity);
-                    if (cmd == CMD_BRIGHTNESS) {
-                        jmethodID mid = (*env)->GetMethodID(env, cls, "setBrightness", "(I)V");
-                        if (mid) (*env)->CallVoidMethod(env, g_activity, mid, (jint)value);
-                    } else if (cmd == 0x02) {
-                        jmethodID mid = (*env)->GetMethodID(env, cls, "setWarmth", "(I)V");
-                        if (mid) (*env)->CallVoidMethod(env, g_activity, mid, (jint)value);
-                    }
-                    if (attached) (*g_jvm)->DetachCurrentThread(g_jvm);
+                    break;
+                }
+                case CMD_BRIGHTNESS: call_activity("setBrightness", 1, value); break;
+                case CMD_WARMTH:     call_activity("setWarmth", 1, value); break;
+                case CMD_REFRESH:    call_activity("refreshScreen", 1, value); break;
+                case CMD_EINK_MODE:  call_activity("setEinkMode", 1, value); break;
+                default: LOGI("Ignoring unknown command 0x%02x", cmd); break;
                 }
                 continue;
             }
@@ -922,28 +1183,39 @@ static void *decode_thread(void *arg) {
             }
             clock_gettime(CLOCK_MONOTONIC, &t1);
 
-            int decompressed_size = LZ4_decompress_safe(
-                (const char *)g_compressed_buf,
-                (char *)decompress_buf,
-                payload_len,
-                g_pixel_count
-            );
-            clock_gettime(CLOCK_MONOTONIC, &t2);
-
-            if (decompressed_size != (int)g_pixel_count) {
-                LOGE("LZ4 decompress failed: got %d, expected %u", decompressed_size, g_pixel_count);
-                if (flags & FLAG_KEYFRAME) break;
-                continue;
-            }
-
-            if (flags & FLAG_KEYFRAME) {
-                memcpy(g_current_frame, decompress_buf, g_pixel_count);
-            } else if (payload_len < 256) {
-                skipped_deltas += 1;
+            if (flags & FLAG_TILED) {
+                // Tiled delta — only changed 64x64 tiles. decompress_buf is scratch.
+                if (!apply_tiled_delta(g_compressed_buf, payload_len, decompress_buf)) {
+                    // Our frame no longer matches the Mac's base — reconnect to resync
+                    // (the server sends a fresh keyframe to every new client).
+                    LOGE("Bad tiled frame — reconnecting to resync");
+                    break;
+                }
+                clock_gettime(CLOCK_MONOTONIC, &t2);
             } else {
-                apply_delta_neon(g_current_frame, decompress_buf, g_pixel_count);
+                int decompressed_size = LZ4_decompress_safe(
+                    (const char *)g_compressed_buf,
+                    (char *)decompress_buf,
+                    payload_len,
+                    g_buffer_size
+                );
+                clock_gettime(CLOCK_MONOTONIC, &t2);
+
+                if (decompressed_size != (int)g_buffer_size) {
+                    LOGE("LZ4 decompress failed: got %d, expected %u", decompressed_size, g_buffer_size);
+                    break;  // resync via reconnect + fresh keyframe
+                }
+
+                if (flags & FLAG_KEYFRAME) {
+                    memcpy(g_current_frame, decompress_buf, g_buffer_size);
+                } else {
+                    // Every delta must be applied — the server never sends no-op deltas,
+                    // and skipping one would desync us until the next keyframe.
+                    apply_delta_neon(g_current_frame, decompress_buf, g_buffer_size);
+                }
             }
             clock_gettime(CLOCK_MONOTONIC, &t3);
+            g_last_frame_ms = now_ms();
 
             send_ack(sock, seq);
             publish_frame(g_current_frame, seq);
@@ -954,6 +1226,7 @@ static void *decode_thread(void *arg) {
                 notify_connection_state(1);
             }
 
+            if (flags & FLAG_TILED) tiled_frames += 1;
             recv_sum += ms_diff(t0, t1);
             decomp_sum += ms_diff(t1, t2);
             delta_sum += ms_diff(t2, t3);
@@ -976,7 +1249,7 @@ static void *decode_thread(void *arg) {
                 g_overwritten_frames = 0;
                 pthread_mutex_unlock(&g_frame_mutex);
 
-                LOGI("FPS: %.1f | recv: %.1fms | lz4: %.1fms | delta: %.1fms | neon: %.1fms | vsync: %.1fms | %uKB %s | drops: %d | skip: %d | overwritten: %d | total: %d",
+                LOGI("FPS: %.1f | recv: %.1fms | lz4: %.1fms | delta: %.1fms | neon: %.1fms | vsync: %.1fms | %uKB %s | drops: %d | tiled: %d | overwritten: %d | total: %d",
                      fps,
                      recv_sum / stat_frames,
                      decomp_sum / stat_frames,
@@ -984,9 +1257,9 @@ static void *decode_thread(void *arg) {
                      neon_avg,
                      vsync_avg,
                      payload_len / 1024,
-                     (flags & FLAG_KEYFRAME) ? "KF" : "delta",
+                     (flags & FLAG_KEYFRAME) ? "KF" : ((flags & FLAG_TILED) ? "tiled" : "delta"),
                      dropped_frames,
-                     skipped_deltas,
+                     tiled_frames,
                      overwritten,
                      frame_count);
 
@@ -994,7 +1267,7 @@ static void *decode_thread(void *arg) {
                 recv_sum = 0;
                 decomp_sum = 0;
                 delta_sum = 0;
-                skipped_deltas = 0;
+                tiled_frames = 0;
                 stat_start = now;
             }
         }
@@ -1003,10 +1276,22 @@ static void *decode_thread(void *arg) {
             close(g_sock);
             g_sock = -1;
         }
+        // Accepted then closed without a byte: nothing serves this host (e.g. a stale USB
+        // tunnel, or the Mac refused the pairing secret) — move to the next candidate.
+        if (!received_any) {
+            pthread_mutex_lock(&g_host_mutex); g_host_index++; pthread_mutex_unlock(&g_host_mutex);
+        }
         LOGI("Disconnected, reconnecting in 1s...");
 
+        if (g_switching) {
+            // Moving to USB: keep the last frame on screen and reconnect at once
+            g_switching = 0;
+            LOGI("Switching to USB");
+            continue;
+        }
+
         if (g_current_frame) {
-            memset(g_current_frame, 0xFF, g_pixel_count);
+            memset(g_current_frame, 0xFF, g_buffer_size);
             publish_frame(g_current_frame, g_ready_seq + 1);
         }
 
@@ -1033,11 +1318,44 @@ cleanup:
 }
 
 // JNI: called from Kotlin when Surface is ready
+// The stream belongs to one activity instance at a time. Android can briefly run two
+// (relaunch while the old one is still tearing down): the newest takes over, and a stop
+// from the older one must not kill the newer one's stream.
+static int g_threads_alive = 0;
+
+static void stop_session(JNIEnv *env)
+{
+    g_running = 0;
+    pthread_cond_broadcast(&g_frame_cond);
+    if (g_sock >= 0) {
+        shutdown(g_sock, SHUT_RDWR);
+        close(g_sock);
+        g_sock = -1;
+    }
+    if (g_threads_alive) {
+        pthread_join(g_decode_thread, NULL);
+        pthread_join(g_render_thread, NULL);
+        g_threads_alive = 0;
+    }
+    if (g_window) {
+        ANativeWindow_release(g_window);
+        g_window = NULL;
+    }
+    if (g_activity) {
+        (*env)->DeleteGlobalRef(env, g_activity);
+        g_activity = NULL;
+    }
+}
+
 JNIEXPORT void JNICALL
 Java_com_daylight_mirror_MirrorActivity_nativeStart(
     JNIEnv *env, jobject thiz, jobject surface, jstring host, jint port)
 {
-    if (g_running) return;
+    if (g_running || g_threads_alive) {
+        if (g_activity && (*env)->IsSameObject(env, thiz, g_activity) && g_running) return;
+        LOGI("Taking over the stream from a previous activity instance");
+        stop_session(env);
+    }
 
     (*env)->GetJavaVM(env, &g_jvm);
     g_activity = (*env)->NewGlobalRef(env, thiz);
@@ -1054,6 +1372,64 @@ Java_com_daylight_mirror_MirrorActivity_nativeStart(
     g_running = 1;
     pthread_create(&g_render_thread, NULL, render_thread, NULL);
     pthread_create(&g_decode_thread, NULL, decode_thread, NULL);
+    g_threads_alive = 1;
+}
+
+// JNI: replace the connection candidates (first entry is tried first)
+JNIEXPORT void JNICALL
+Java_com_daylight_mirror_MirrorActivity_nativeSetHosts(
+    JNIEnv *env, jobject thiz, jobjectArray hosts)
+{
+    (void)thiz;
+    int n = (*env)->GetArrayLength(env, hosts);
+    if (n > MAX_HOSTS) n = MAX_HOSTS;
+    pthread_mutex_lock(&g_host_mutex);
+    char current[64];
+    strncpy(current, g_hosts[g_host_index < g_host_count ? g_host_index : 0], sizeof(current));
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        jstring js = (jstring)(*env)->GetObjectArrayElement(env, hosts, i);
+        if (!js) continue;
+        const char *h = (*env)->GetStringUTFChars(env, js, NULL);
+        strncpy(g_hosts[count], h, sizeof(g_hosts[count]) - 1);
+        g_hosts[count][sizeof(g_hosts[count]) - 1] = 0;
+        (*env)->ReleaseStringUTFChars(env, js, h);
+        (*env)->DeleteLocalRef(env, js);
+        count++;
+    }
+    if (count == 0) { strcpy(g_hosts[0], "127.0.0.1"); count = 1; }
+    g_host_count = count;
+    // Keep pointing at the same host if it is still a candidate
+    g_host_index = 0;
+    for (int i = 0; i < count; i++) if (strcmp(g_hosts[i], current) == 0) { g_host_index = i; break; }
+    pthread_mutex_unlock(&g_host_mutex);
+    LOGI("Connection candidates: %d host(s)", count);
+}
+
+// JNI: pairing secret for Wi-Fi connections (16 bytes)
+JNIEXPORT void JNICALL
+Java_com_daylight_mirror_MirrorActivity_nativeSetToken(
+    JNIEnv *env, jobject thiz, jbyteArray token)
+{
+    (void)thiz;
+    if (!token || (*env)->GetArrayLength(env, token) != AUTH_TOKEN_LEN) { g_has_token = 0; return; }
+    (*env)->GetByteArrayRegion(env, token, 0, AUTH_TOKEN_LEN, (jbyte *)g_token);
+    g_has_token = 1;
+}
+
+// JNI: the USB tunnel works (Kotlin probed it) while we stream over Wi-Fi — switch to it.
+// Host 0 is always 127.0.0.1.
+JNIEXPORT void JNICALL
+Java_com_daylight_mirror_MirrorActivity_nativeSwitchToUSB(
+    JNIEnv *env, jobject thiz)
+{
+    (void)env; (void)thiz;
+    if (g_sock < 0 || is_loopback_host(g_host)) return;
+    pthread_mutex_lock(&g_host_mutex);
+    g_host_index = 0;
+    pthread_mutex_unlock(&g_host_mutex);
+    g_switching = 1;
+    shutdown(g_sock, SHUT_RDWR);
 }
 
 // JNI: called from Kotlin when Surface is destroyed
@@ -1061,23 +1437,12 @@ JNIEXPORT void JNICALL
 Java_com_daylight_mirror_MirrorActivity_nativeStop(
     JNIEnv *env, jobject thiz)
 {
-    g_running = 0;
-    pthread_cond_broadcast(&g_frame_cond);
-    if (g_sock >= 0) {
-        shutdown(g_sock, SHUT_RDWR);
-        close(g_sock);
-        g_sock = -1;
+    // A newer activity instance owns the stream now — leave it alone
+    if (g_activity && !(*env)->IsSameObject(env, thiz, g_activity)) {
+        LOGI("Ignoring stop from a previous activity instance");
+        return;
     }
-    pthread_join(g_decode_thread, NULL);
-    pthread_join(g_render_thread, NULL);
-    if (g_window) {
-        ANativeWindow_release(g_window);
-        g_window = NULL;
-    }
-    if (g_activity) {
-        (*env)->DeleteGlobalRef(env, g_activity);
-        g_activity = NULL;
-    }
+    stop_session(env);
 }
 
 // JNI: called from Kotlin on surfaceChanged with actual surface dimensions.
@@ -1090,4 +1455,16 @@ Java_com_daylight_mirror_MirrorActivity_nativeSetSurfaceSize(
     g_surface_w = (uint32_t)width;
     g_surface_h = (uint32_t)height;
     LOGI("Surface size: %ux%u (from surfaceChanged)", g_surface_w, g_surface_h);
+}
+
+// JNI: milliseconds since the last decoded frame (-1 before the first frame).
+// Polled by Kotlin to drive the e-ink "auto" waveform mode.
+JNIEXPORT jlong JNICALL
+Java_com_daylight_mirror_MirrorActivity_nativeLastFrameAgeMs(
+    JNIEnv *env, jobject thiz)
+{
+    (void)env; (void)thiz;
+    int64_t last = g_last_frame_ms;
+    if (last == 0) return -1;
+    return (jlong)(now_ms() - last);
 }

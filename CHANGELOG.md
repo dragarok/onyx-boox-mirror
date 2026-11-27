@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.6-boox] — 2026-11-27 (Onyx BOOX fork)
+
+### Added
+- Onyx BOOX Tab Ultra C support: HiDPI virtual display modes, colour and greyscale, e-ink refresh modes (Auto/Quality/Balanced/Fast), frontlight and warmth over USB
+- Mirror and second-monitor modes; the Mac screen only dims in mirror mode
+- Touch (taps, drags, two-finger scroll) and keyboard input from the BOOX, with layout-independent key injection
+- Wi-Fi streaming on the local network, paired over USB with a shared secret; USB is preferred and taken over automatically when plugged in
+- Start from the tablet: the BOOX app finds the Mac (USB or Bonjour), asks "Mirror Mac" or "Second monitor", and starts it — no Mac interaction
+- "Remember my choice" auto-starts the last mode, with "Choose another mode" during the start
+- Settings on the BOOX (mode, resolution, colour, e-ink refresh, full refresh, stop), opened with a four-finger tap while mirroring
+- Remote-control port 8893 (`STATUS`, `START`, `RELEASE`, `STOP`, `REFRESH`, `SETTINGS`, `SET`)
+- Device-started sessions stop 60 s after the tablet goes away; Back on the tablet stops them at once
+- Keeps the Mac from idle-sleeping on AC while Wireless is on
+- `daylight-mirror wireless [on|off]` CLI command
+- USB vs Wi-Fi benchmark (`scripts/bench`)
+
+### Fixed
+- Re-creating an existing adb tunnel dropped the live USB connection mid-start
+- A session could stop itself 60 s after starting when the tablet connected before the session was registered
+- Relaunching the BOOX app could leave it stuck on "Starting…" (stream ownership between activity instances)
+- A touch cancelled by the BOOX system (its three-finger gestures) no longer clicks on the Mac
+
 ## [1.8.0] — 2026-03-07
 
 ### Added

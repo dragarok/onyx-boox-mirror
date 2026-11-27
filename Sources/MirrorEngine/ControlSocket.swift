@@ -163,11 +163,12 @@ public class ControlSocket {
                 // Accept preset names ("sharp", "portrait-cozy"), raw values ("1600x1200"),
                 // and hyphenated/spaced variants of multi-word labels.
                 let normalizedArg = arg.lowercased().replacingOccurrences(of: "-", with: " ")
-                let preset = DisplayResolution.allCases.first {
+                let dc1Presets = DisplayResolution.presets(for: .daylightDC1)
+                let preset = dc1Presets.first {
                     $0.rawValue == arg || $0.label.lowercased() == normalizedArg
                 }
                 guard let newRes = preset else {
-                    let valid = DisplayResolution.allCases.map { $0.label.lowercased().replacingOccurrences(of: " ", with: "-") }.joined(separator: ", ")
+                    let valid = dc1Presets.map { $0.label.lowercased().replacingOccurrences(of: " ", with: "-") }.joined(separator: ", ")
                     return "ERR unknown resolution (valid: \(valid))"
                 }
                 if newRes == engine.resolution {
@@ -186,6 +187,38 @@ public class ControlSocket {
             } else {
                 return "OK \(engine.resolution.label.lowercased())"
             }
+
+        case "BOOX-RESOLUTION":
+            let presets = DisplayResolution.presets(for: .boox)
+            func slug(_ r: DisplayResolution) -> String { r.label.lowercased().replacingOccurrences(of: " ", with: "-") }
+            guard let arg = arg else { return "OK \(slug(engine.booxResolution)) (\(engine.booxResolution.displaySize))" }
+            guard let newRes = presets.first(where: { $0.rawValue == arg || slug($0) == arg.lowercased() }) else {
+                return "ERR unknown BOOX preset (valid: \(presets.map(slug).joined(separator: ", ")))"
+            }
+            let restarting = engine.status == .running && engine.hasBoox && newRes != engine.booxResolution
+            engine.applyBooxSettings(resolution: newRes)
+            return "OK \(slug(newRes))\(restarting ? " (restarting)" : "")"
+
+        case "COLOR":
+            guard let arg = arg?.lowercased() else { return "OK \(engine.booxColor ? "on" : "off")" }
+            guard arg == "on" || arg == "off" else { return "ERR usage: color [on|off]" }
+            let on = arg == "on"
+            let restarting = engine.status == .running && engine.hasBoox && on != engine.booxColor
+            engine.applyBooxSettings(color: on)
+            return "OK \(arg)\(restarting ? " (restarting)" : "")"
+
+        case "EINK":
+            guard let arg = arg?.lowercased() else { return "OK \(engine.einkMode.label.lowercased())" }
+            guard let mode = EinkMode.allCases.first(where: { $0.label.lowercased() == arg }) else {
+                return "ERR unknown mode (valid: \(EinkMode.allCases.map { $0.label.lowercased() }.joined(separator: ", ")))"
+            }
+            engine.einkMode = mode
+            return "OK \(arg)"
+
+        case "REFRESH":
+            guard engine.status == .running, engine.hasBoox else { return "ERR no BOOX session running" }
+            engine.refreshScreen()
+            return "OK refreshed"
 
         case "RESTART":
             if engine.status == .running {
@@ -257,10 +290,19 @@ public class ControlSocket {
                 return "OK \(String(format: "%.1f", engine.contrastAmount))"
             }
 
+        case "WIRELESS":
+            guard let arg = arg?.lowercased() else {
+                return "OK \(engine.wirelessEnabled ? "on" : "off") \(engine.lanAddresses.joined(separator: ","))"
+            }
+            guard arg == "on" || arg == "off" else { return "ERR usage: wireless [on|off]" }
+            let restarting = engine.status == .running && engine.wirelessEnabled != (arg == "on")
+            engine.wirelessEnabled = arg == "on"
+            return "OK \(arg)\(restarting ? " (restarting)" : "")"
+
         case "DISPLAYMODE":
             if let arg = arg?.lowercased() {
-                guard let mode = DisplayMode(rawValue: arg) else {
-                    return "ERR unknown mode (valid: mirror, extended)"
+                guard let mode = DisplayMode(rawValue: arg == "extend" ? "extended" : arg) else {
+                    return "ERR unknown mode (valid: mirror, extend)"
                 }
                 if mode == engine.displayMode {
                     return "OK \(mode.rawValue) (no change)"

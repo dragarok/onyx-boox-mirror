@@ -17,6 +17,8 @@ public class DeviceSession: Identifiable {
     public let resolution: DisplayResolution
     public let displayMode: DisplayMode
     public let device: ConnectedDevice
+    /// RGB frames (color e-ink) instead of greyscale.
+    public let useColor: Bool
 
     private(set) var displayManager: VirtualDisplayManager?
     private(set) var tcpServer: TCPServer?
@@ -42,40 +44,67 @@ public class DeviceSession: Identifiable {
     var onClientCountChanged: ((Int) -> Void)?
     var onLatencyStats: ((LatencyStats) -> Void)?
 
-    init(port: UInt16, resolution: DisplayResolution, displayMode: DisplayMode, device: ConnectedDevice) {
+    /// Wireless: servers also accept paired clients over the LAN.
+    let wireless: Bool
+    /// False when the device itself asked to start: its app is already open and waiting,
+    /// so don't restart it.
+    var relaunchCompanion = true
+
+    init(port: UInt16, resolution: DisplayResolution, displayMode: DisplayMode, device: ConnectedDevice,
+         useColor: Bool = false, wireless: Bool = false) {
+        self.wireless = wireless
         self.port = port
         self.resolution = resolution
         self.displayMode = displayMode
         self.device = device
+        self.useColor = useColor
+    }
+
+    /// Family used for pipeline decisions. A lone unidentified device is a DC-1.
+    var family: DeviceFamily {
+        device.deviceFamily == .other ? .daylightDC1 : device.deviceFamily
     }
 
     /// Start the full pipeline: virtual display → capture → TCP server → ADB tunnel → launch app.
     func start(wsServer: WebSocketServer?, sharpenAmount: Double, contrastAmount: Double, gammaAmount: Double) async throws {
         let w = resolution.width
         let h = resolution.height
-        let displayName = device.deviceFamily.rawValue
+        let displayName = family == .boox ? device.displayName : family.rawValue
 
         // 1. Virtual display
-        displayManager = VirtualDisplayManager(width: w, height: h, hiDPI: resolution.isHiDPI, name: displayName)
+        displayManager = VirtualDisplayManager(width: w, height: h, hiDPI: resolution.isHiDPI, name: displayName,
+                                               productID: family == .boox ? 0xB00C : 0xDA7E)
         try? await Task.sleep(for: .seconds(1))
+        displayManager?.applyTargetMode()
 
         // 2. Mirror or extend
         if displayMode == .mirror {
             displayManager?.mirrorBuiltInDisplay()
         } else {
             NSLog("[Session:%@] Extended display mode — second screen", device.serial)
+            displayManager?.ensureExtended()
         }
         try? await Task.sleep(for: .seconds(1))
+        // Capture assumes the display runs at exactly w x h backing pixels.
+        if displayManager?.applyTargetMode() == false {
+            NSLog("[Session:%@] Display not in %dx%d mode — output will be scaled", device.serial, w, h)
+        }
 
-        // 3. Compositor pacer (forces frame delivery at target FPS)
-        let pacer = CompositorPacer(targetDisplayID: displayManager!.displayID)
-        pacer.start()
-        compositorPacer = pacer
+        // 3. Compositor pacer (forces frame delivery at target FPS). Not used for e-ink:
+        //    the panel wants event-driven updates, and the pacer's flickering 4x4 window
+        //    is a permanently dirty (visible) tile in RGB mode.
+        if family != .boox {
+            let pacer = CompositorPacer(targetDisplayID: displayManager!.displayID)
+            pacer.start()
+            compositorPacer = pacer
+        }
 
         // 4. TCP server on this session's port
-        let tcp = try TCPServer(port: port)
+        let tcp = try TCPServer(port: port, allowNetwork: wireless)
         tcp.frameWidth = UInt16(w)
         tcp.frameHeight = UInt16(h)
+        tcp.isColorMode = useColor
+        tcp.sendsEinkState = family == .boox
         tcp.onClientCountChanged = { [weak self] count in
             self?.clientCount = count
             self?.onClientCountChanged?(count)
@@ -90,7 +119,8 @@ public class DeviceSession: Identifiable {
 
         // 5. Input server — receives touch events from the device, injects as Mac cursor
         do {
-            let input = try InputServer(port: INPUT_PORT, targetDisplayID: displayManager!.displayID)
+            let input = try InputServer(port: INPUT_PORT, targetDisplayID: displayManager!.displayID,
+                                        allowNetwork: wireless)
             input.start()
             inputServer = input
         } catch {
@@ -101,7 +131,8 @@ public class DeviceSession: Identifiable {
         let cap = ScreenCapture(
             tcpServer: tcp, wsServer: wsServer,
             targetDisplayID: displayManager!.displayID,
-            width: Int(w), height: Int(h)
+            width: Int(w), height: Int(h),
+            useColor: useColor, targetFPS: family.targetFPS
         )
         cap.sharpenAmount = sharpenAmount
         cap.contrastAmount = contrastAmount
@@ -124,24 +155,29 @@ public class DeviceSession: Identifiable {
         // 8. ADB: install APK if needed, set up tunnel, launch app
         await setupADB()
 
-        NSLog("[Session:%@] Started — %@, %dx%d, port %d, %@",
+        NSLog("[Session:%@] Started — %@, %dx%d, port %d, %@, %@",
               device.serial, displayName, w, h, port,
-              displayMode == .mirror ? "mirror" : "extended")
+              displayMode == .mirror ? "mirror" : "extended", useColor ? "RGB" : "greyscale")
     }
 
     /// Set up ADB connection: reset display override, install APK, reverse tunnel, launch app.
     private func setupADB() async {
         let serial = device.serial
         let maxAttempts = 3
+        // Wi-Fi session with no USB device: nothing to tunnel or launch.
+        guard serial != "none" else {
+            adbConnected = false
+            return
+        }
 
         // Reset display size override to get full physical panel resolution.
         // Without this, the DC-1's 1184x1584 override causes scaling artifacts.
         ADBBridge.resetDisplaySizeOverride(serial: serial)
 
         for attempt in 1...maxAttempts {
-            // Auto-install bundled APK if needed
-            if !ADBBridge.isAppInstalled(serial: serial) {
-                NSLog("[Session:%@] Installing companion app (attempt %d)...", serial, attempt)
+            // Auto-install the bundled APK if it is missing or speaks an older protocol
+            if !ADBBridge.isCompanionUpToDate(serial: serial) {
+                NSLog("[Session:%@] Installing companion app v%d (attempt %d)...", serial, COMPANION_VERSION_CODE, attempt)
                 if let error = ADBBridge.installBundledAPK(serial: serial) {
                     NSLog("[Session:%@] APK install error: %@", serial, error)
                 }
@@ -156,7 +192,13 @@ public class DeviceSession: Identifiable {
                 if !inputTunnelOK {
                     NSLog("[Session:%@] WARNING: Input tunnel failed — touch disabled", serial)
                 }
-                ADBBridge.launchApp(serial: serial, forceRestart: true)
+                _ = ADBBridge.setupReverseTunnel(serial: serial, devicePort: REMOTE_PORT, hostPort: REMOTE_PORT)
+                // Launching over USB also pairs the device for Wi-Fi: hand over the
+                // secret and this Mac's LAN addresses.
+                if relaunchCompanion {
+                    ADBBridge.launchApp(serial: serial, forceRestart: true,
+                                        pairing: (NetworkAccess.secretHex, NetworkAccess.lanAddresses()))
+                }
                 adbConnected = true
                 return
             }
@@ -193,6 +235,11 @@ public class DeviceSession: Identifiable {
         }
 
         NSLog("[Session:%@] Stopped", device.serial)
+    }
+
+    /// Send a display command (brightness, warmth, e-ink mode, refresh) to the device app.
+    func sendCommand(_ cmd: UInt8, value: UInt8) {
+        tcpServer?.sendCommand(cmd, value: value)
     }
 
     /// Update sharpen amount on the live capture stream.

@@ -44,6 +44,26 @@ class TCPServer {
     // brightness/warmth don't reset to defaults after a reconnect.
     private var lastBrightness: UInt8 = 128
     private var lastWarmth: UInt8 = 128
+    private var lastEinkMode: UInt8 = EinkMode.auto.rawValue
+
+    /// RGB (3 bytes/pixel) instead of greyscale (1 byte/pixel). Announced to each
+    /// client before CMD_RESOLUTION so it can size its buffers.
+    var isColorMode: Bool = false {
+        didSet { if oldValue != isColorMode { broadcastColorMode() } }
+    }
+    /// Whether the client is a BOOX panel that should receive Onyx frontlight/EPD state.
+    var sendsEinkState: Bool = false
+
+    private var _keyframeRequested = false
+    /// Set when a client connects; the capture loop sends a fresh keyframe next.
+    /// (A cached keyframe can be up to a second stale, and the deltas that follow it
+    /// are computed against newer frames — that would corrupt the client's image.)
+    func consumeKeyframeRequest() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let r = _keyframeRequested
+        _keyframeRequested = false
+        return r
+    }
 
     private var sendTimestamps: [UInt32: Double] = [:]
     private let rttLock = NSLock()
@@ -61,10 +81,12 @@ class TCPServer {
         return val
     }
 
-    init(port: UInt16) throws {
-        let params = NWParameters.tcp
-        let tcpOptions = params.defaultProtocolStack.transportProtocol as! NWProtocolTCP.Options
-        tcpOptions.noDelay = true
+    /// Wireless: also accept paired clients from the LAN (see NetworkAccess).
+    let allowNetwork: Bool
+
+    init(port: UInt16, allowNetwork: Bool = false) throws {
+        self.allowNetwork = allowNetwork
+        let params = NetworkAccess.listenerParameters(allowNetwork: allowNetwork)
         listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
     }
 
@@ -77,14 +99,54 @@ class TCPServer {
 
         listener.newConnectionHandler = { [weak self] conn in
             guard let self = self else { return }
+            let viaNetwork = !NetworkAccess.isLoopback(conn.endpoint)
+            if viaNetwork && !self.allowNetwork {
+                conn.cancel()
+                return
+            }
             conn.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
+                    // LAN clients must present the pairing secret before seeing the screen
+                    if viaNetwork {
+                        NetworkAccess.authenticate(conn, queue: self.queue) { ok in
+                            if ok {
+                                print("[TCP] Wi-Fi client paired: \(conn.endpoint)")
+                                self.admit(conn)
+                            } else {
+                                print("[TCP] Rejected unpaired client \(conn.endpoint)")
+                                conn.cancel()
+                            }
+                        }
+                        return
+                    }
+                    self.admit(conn)
+                case .failed, .cancelled:
+                    self.lock.lock()
+                    let wasAdmitted = self.connections.contains { $0 === conn }
+                    self.connections.removeAll { $0 === conn }
+                    let count = self.connections.count
+                    self.lock.unlock()
+                    guard wasAdmitted else { return }
+                    self.onClientCountChanged?(count)
+                    print("[TCP] Client disconnected (\(state))")
+                default: break
+                }
+            }
+            conn.start(queue: self.queue)
+        }
+
+        listener.start(queue: queue)
+    }
+
+    /// Start streaming to a connected (and, for Wi-Fi, paired) client.
+    private func admit(_ conn: NWConnection) {
                     print("[TCP] Client connected")
                     self.lock.lock()
                     self.connections.append(conn)
                     let count = self.connections.count
                     let cachedKeyframe = self.lastKeyframeData
+                    self._keyframeRequested = true
                     self.lock.unlock()
                     self.rttLock.lock()
                     self._inflightFrames = 0
@@ -92,7 +154,9 @@ class TCPServer {
                     self.rttLock.unlock()
                     self.onClientCountChanged?(count)
 
-                    // Tell client our frame dimensions and display state before sending frames
+                    // Pixel format first (buffers are sized from it), then dimensions,
+                    // then display state — all before any frame.
+                    self.sendColorMode(to: conn)
                     self.sendResolution(to: conn)
                     self.sendDisplayState(to: conn)
 
@@ -104,20 +168,6 @@ class TCPServer {
                     }
 
                     self.receiveLoop(conn)
-                case .failed, .cancelled:
-                    self.lock.lock()
-                    self.connections.removeAll { $0 === conn }
-                    let count = self.connections.count
-                    self.lock.unlock()
-                    self.onClientCountChanged?(count)
-                    print("[TCP] Client disconnected (\(state))")
-                default: break
-                }
-            }
-            conn.start(queue: self.queue)
-        }
-
-        listener.start(queue: queue)
     }
 
     func stop() {
@@ -206,10 +256,10 @@ class TCPServer {
         }
     }
 
-    func broadcast(payload: Data, isKeyframe: Bool, sequenceNumber: UInt32 = 0) {
+    func broadcast(payload: Data, isKeyframe: Bool, sequenceNumber: UInt32 = 0, tiled: Bool = false) {
         var header = Data(capacity: FRAME_HEADER_SIZE)
         header.append(contentsOf: MAGIC_FRAME)
-        header.append(isKeyframe ? FLAG_KEYFRAME : 0)
+        header.append(isKeyframe ? FLAG_KEYFRAME : (tiled ? FLAG_TILED : 0))
         var seq = sequenceNumber.littleEndian
         header.append(Data(bytes: &seq, count: 4))
         var len = UInt32(payload.count).littleEndian
@@ -247,6 +297,7 @@ class TCPServer {
         // Track state so we can re-send on client reconnect
         if cmd == CMD_BRIGHTNESS { lastBrightness = value }
         if cmd == CMD_WARMTH { lastWarmth = value }
+        if cmd == CMD_EINK_MODE { lastEinkMode = value }
 
         var packet = Data(capacity: 4)
         packet.append(contentsOf: MAGIC_CMD)
@@ -281,6 +332,33 @@ class TCPServer {
         bPkt.append(lastBrightness)
         conn.send(content: bPkt, completion: .contentProcessed { _ in })
         print("[TCP] Sent brightness: \(self.lastBrightness)")
+
+        guard sendsEinkState else { return }
+        for (cmd, value) in [(CMD_WARMTH, lastWarmth), (CMD_EINK_MODE, lastEinkMode)] {
+            var pkt = Data(capacity: 4)
+            pkt.append(contentsOf: MAGIC_CMD)
+            pkt.append(cmd)
+            pkt.append(value)
+            conn.send(content: pkt, completion: .contentProcessed { _ in })
+        }
+    }
+
+    /// Send pixel format to a specific client: [DA 7F] [05] [0=grey, 1=RGB]
+    func sendColorMode(to conn: NWConnection) {
+        var packet = Data(capacity: 4)
+        packet.append(contentsOf: MAGIC_CMD)
+        packet.append(CMD_COLOR_MODE)
+        packet.append(isColorMode ? 1 : 0)
+        conn.send(content: packet, completion: .contentProcessed { _ in })
+        print("[TCP] Sent color mode: \(isColorMode ? "RGB" : "greyscale")")
+    }
+
+    private func broadcastColorMode() {
+        lock.lock()
+        let conns = connections
+        _keyframeRequested = true
+        lock.unlock()
+        for conn in conns { sendColorMode(to: conn) }
     }
 
     /// Send resolution command to a specific client: [DA 7F] [04] [w:2 LE] [h:2 LE]

@@ -1,15 +1,21 @@
-// DisplayController.swift — Keyboard controls for Daylight hardware.
+// DisplayController.swift — Frontlight + e-ink controls for the attached panel.
 //
-// Intercepts Ctrl+function key events for Daylight display control:
+// Intercepts Ctrl+function key events for display control:
 //   Ctrl+F1/F2:   Brightness down/up
+//   Ctrl+F5:      Full e-ink refresh (BOOX — clears ghosting)
 //   Ctrl+F10:     Toggle backlight on/off
 //   Ctrl+F11/F12: Warmth (amber) down/up
+//
+// DC-1: brightness goes to the app (window brightness), warmth via adb settings.
+// BOOX: both go to the app, which writes the Onyx frontlight sysfs nodes
+// (onyx_bl_br / onyx_bl_ct, world-writable, 0...max_brightness).
 
 import AppKit
 
 class DisplayController {
     let tcpServer: TCPServer
     let deviceSerial: String?  // For targeted ADB commands
+    let family: DeviceFamily
     var currentBrightness: Int = 128
     var currentWarmth: Int = 128
     var backlightOn: Bool = true
@@ -21,15 +27,84 @@ class DisplayController {
     var onWarmthChanged: ((Int) -> Void)?
     var onBacklightChanged: ((Bool) -> Void)?
 
-    init(tcpServer: TCPServer, deviceSerial: String? = nil) {
+    init(tcpServer: TCPServer, deviceSerial: String? = nil, family: DeviceFamily = .daylightDC1) {
         self.tcpServer = tcpServer
         self.deviceSerial = deviceSerial
+        self.family = family
+    }
+
+    /// Read an Onyx frontlight node as 0-255 (scaled from 0...max_brightness).
+    private func readOnyxLight(_ node: String) -> Int? {
+        guard let raw = ADBBridge.shellOutput(["cat", "/sys/class/backlight/\(node)/brightness",
+                                                "/sys/class/backlight/\(node)/max_brightness"],
+                                              serial: deviceSerial) else { return nil }
+        let nums = raw.split(whereSeparator: { $0.isNewline }).compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard nums.count == 2, nums[1] > 0 else { return nil }
+        lightLock.lock(); lightMax[node] = nums[1]; lightLock.unlock()
+        return min(255, nums[0] * 255 / nums[1])
+    }
+
+    // BOOX frontlight writes go through adb: the sysfs nodes are writable by the shell
+    // user but SELinux denies regular apps (EACCES), so the companion can't do it.
+    // Slider ticks are coalesced — only the newest value per node is written.
+    private let lightLock = NSLock()
+    private var lightMax: [String: Int] = [:]
+    private var pendingLight: [String: Int] = [:]
+    private var lightWriterRunning = false
+
+    private func writeOnyxLight(_ node: String, _ value255: Int) {
+        lightLock.lock()
+        pendingLight[node] = max(0, min(255, value255))
+        let startWriter = !lightWriterRunning
+        if startWriter { lightWriterRunning = true }
+        lightLock.unlock()
+        guard startWriter else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            while true {
+                self.lightLock.lock()
+                guard let (n, v) = self.pendingLight.first else {
+                    self.lightWriterRunning = false
+                    self.lightLock.unlock()
+                    return
+                }
+                self.pendingLight[n] = nil
+                let maxRaw = self.lightMax[n] ?? 32
+                self.lightLock.unlock()
+                let raw = (v * maxRaw + 127) / 255
+                // One string so the device shell sees the redirect.
+                ADBBridge.shell(["echo \(raw) > /sys/class/backlight/\(n)/brightness"], serial: self.deviceSerial)
+            }
+        }
+    }
+
+    /// Send a brightness value to the panel (0 = light off).
+    private func pushBrightness(_ value: Int) {
+        if family.usesOnyxFrontlight { writeOnyxLight("onyx_bl_br", value) }
+        tcpServer.sendCommand(CMD_BRIGHTNESS, value: UInt8(max(0, min(255, value))))
     }
 
     func start() {
         // Query current values from device
         DispatchQueue.global().async { [weak self] in
             guard let self = self else { return }
+            if self.family.usesOnyxFrontlight {
+                if let val = self.readOnyxLight("onyx_bl_br") {
+                    self.currentBrightness = val
+                    self.savedBrightness = max(val, 1)
+                    self.backlightOn = val > 0
+                    self.tcpServer.sendCommand(CMD_BRIGHTNESS, value: UInt8(val))
+                    self.onBrightnessChanged?(val)
+                    self.onBacklightChanged?(self.backlightOn)
+                }
+                if let val = self.readOnyxLight("onyx_bl_ct") {
+                    self.currentWarmth = val
+                    self.tcpServer.sendCommand(CMD_WARMTH, value: UInt8(val))
+                    self.onWarmthChanged?(val)
+                }
+                print("[Display] BOOX frontlight: brightness \(self.currentBrightness)/255, warmth \(self.currentWarmth)/255")
+                return
+            }
             if let val = ADBBridge.querySystemSetting("screen_brightness", serial: self.deviceSerial) {
                 self.currentBrightness = val
                 self.savedBrightness = val
@@ -52,6 +127,7 @@ class DisplayController {
             switch event.keyCode {
             case 122: self.adjustBrightness(by: -BRIGHTNESS_STEP)  // Ctrl+F1
             case 120: self.adjustBrightness(by: BRIGHTNESS_STEP)   // Ctrl+F2
+            case 96:  self.refreshScreen()                         // Ctrl+F5
             case 109: self.toggleBacklight()                       // Ctrl+F10
             case 103: self.adjustWarmth(by: -WARMTH_STEP)          // Ctrl+F11
             case 111: self.adjustWarmth(by: WARMTH_STEP)           // Ctrl+F12
@@ -68,6 +144,7 @@ class DisplayController {
             switch keyCode {
             case 3: self.adjustBrightness(by: -BRIGHTNESS_STEP)  // Ctrl+F1 media
             case 2: self.adjustBrightness(by: BRIGHTNESS_STEP)   // Ctrl+F2 media
+            case 23: self.refreshScreen()                        // Ctrl+F5 media
             case 7: self.toggleBacklight()                       // Ctrl+F10 media
             case 1: self.adjustWarmth(by: -WARMTH_STEP)          // Ctrl+F11 media
             case 0: self.adjustWarmth(by: WARMTH_STEP)           // Ctrl+F12 media
@@ -75,7 +152,7 @@ class DisplayController {
             }
         }
 
-        print("[Display] Ctrl+F1/F2: brightness | Ctrl+F10: backlight toggle | Ctrl+F11/F12: warmth")
+        print("[Display] Ctrl+F1/F2: brightness | Ctrl+F5: e-ink refresh | Ctrl+F10: backlight toggle | Ctrl+F11/F12: warmth")
     }
 
     func stop() {
@@ -102,7 +179,7 @@ class DisplayController {
         currentBrightness = max(0, min(255, value))
         savedBrightness = max(currentBrightness, 1)
         backlightOn = currentBrightness > 0
-        tcpServer.sendCommand(CMD_BRIGHTNESS, value: UInt8(currentBrightness))
+        pushBrightness(currentBrightness)
         onBrightnessChanged?(currentBrightness)
         onBacklightChanged?(backlightOn)
     }
@@ -114,23 +191,37 @@ class DisplayController {
     }
 
     func adjustWarmth(by delta: Int) {
-        currentWarmth = max(0, min(255, currentWarmth + delta))
-        // Warmth goes via adb shell — screen_brightness_amber_rate is a Daylight-protected
-        // setting that only the shell user can write, not a regular Android app.
-        DispatchQueue.global().async { [warmth = currentWarmth, serial = deviceSerial] in
-            ADBBridge.setSystemSetting("screen_brightness_amber_rate", value: warmth, serial: serial)
+        setWarmth(currentWarmth + delta)
+    }
+
+    func setWarmth(_ value: Int) {
+        currentWarmth = max(0, min(255, value))
+        if family.usesOnyxFrontlight {
+            writeOnyxLight("onyx_bl_ct", currentWarmth)
+            tcpServer.sendCommand(CMD_WARMTH, value: UInt8(currentWarmth))
+        } else {
+            // DC-1: screen_brightness_amber_rate is a Daylight-protected setting that only
+            // the shell user can write, not a regular Android app.
+            DispatchQueue.global().async { [warmth = currentWarmth, serial = deviceSerial] in
+                ADBBridge.setSystemSetting("screen_brightness_amber_rate", value: warmth, serial: serial)
+            }
         }
         onWarmthChanged?(currentWarmth)
         print("[Display] Warmth -> \(currentWarmth)/255")
     }
 
-    func setWarmth(_ value: Int) {
-        currentWarmth = max(0, min(255, value))
-        DispatchQueue.global().async { [warmth = currentWarmth, serial = deviceSerial] in
-            ADBBridge.setSystemSetting("screen_brightness_amber_rate", value: warmth, serial: serial)
-        }
-        onWarmthChanged?(currentWarmth)
-        print("[Display] Warmth -> \(currentWarmth)/255")
+    /// Full e-ink refresh (GC16 flash) to clear accumulated ghosting. BOOX only.
+    func refreshScreen() {
+        guard family == .boox else { return }
+        tcpServer.sendCommand(CMD_REFRESH, value: 1)
+        print("[Display] Full e-ink refresh")
+    }
+
+    /// Set the panel waveform preference (auto / quality / balanced / fast). BOOX only.
+    func setEinkMode(_ mode: EinkMode) {
+        guard family == .boox else { return }
+        tcpServer.sendCommand(CMD_EINK_MODE, value: mode.rawValue)
+        print("[Display] E-ink mode -> \(mode.label)")
     }
 
     func toggleBacklight() {
@@ -138,14 +229,14 @@ class DisplayController {
             savedBrightness = max(currentBrightness, 1)
             currentBrightness = 0
             backlightOn = false
-            tcpServer.sendCommand(CMD_BRIGHTNESS, value: 0)
+            pushBrightness(0)
             onBrightnessChanged?(0)
             onBacklightChanged?(false)
             print("[Display] Backlight OFF")
         } else {
             currentBrightness = savedBrightness
             backlightOn = true
-            tcpServer.sendCommand(CMD_BRIGHTNESS, value: UInt8(currentBrightness))
+            pushBrightness(currentBrightness)
             onBrightnessChanged?(currentBrightness)
             onBacklightChanged?(true)
             print("[Display] Backlight ON -> \(currentBrightness)/255")

@@ -6,12 +6,12 @@
 	<string>Daylight Mirror</string>
 	<key>CFBundleExecutable</key>
 	<string>DaylightMirror</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.daylight.mirror</string>
 	<key>CFBundleName</key>
 	<string>Daylight Mirror</string>
-	<key>CFBundleIconFile</key>
-	<string>AppIcon</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -22,5 +22,11 @@
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_daylight-mirror._tcp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Daylight Mirror streams your screen to your e-ink tablet over Wi-Fi and receives its touch and keyboard input.</string>
 </dict>
 </plist>

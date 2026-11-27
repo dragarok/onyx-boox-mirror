@@ -6,7 +6,7 @@
 import Foundation
 
 struct UpdateChecker {
-    static let repo = "welfvh/daylight-mirror"
+    static let repo = "dragarok/onyx-boox-mirror"  // this fork — upstream releases lack BOOX support
 
     struct Release {
         let version: String

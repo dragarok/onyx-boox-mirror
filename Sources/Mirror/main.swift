@@ -599,6 +599,13 @@ func printUsage() {
     print("  backlight [on|off|toggle] Get or toggle backlight")
     print("  resolution [preset]      Get or set resolution (cozy, comfortable, balanced, sharp,")
     print("                             portrait-cozy, portrait-balanced, portrait-sharp)")
+    print("  boox-resolution [preset] Get or set the BOOX preset (retina, cozy, color-native,")
+    print("                             more-space, portrait-retina, portrait-color-native)")
+    print("  color [on|off]           Get or set RGB frames for BOOX color panels")
+    print("  eink [mode]              Get or set BOOX waveform: auto, quality, balanced, fast")
+    print("  mode [mirror|extend]     Mirror the Mac screen, or use the device as a second monitor")
+    print("  wireless [on|off]        Also stream over Wi-Fi to devices paired via USB")
+    print("  refresh                  Full e-ink refresh on the BOOX (clears ghosting)")
     print("  sharpen [0.0-3.0]        Get or set sharpening (0=none, 1=mild, 2=strong)")
     print("  contrast [1.0-2.0]       Get or set contrast (1.0=off, 1.5=moderate, 2.0=high)")
     print("  fontsmoothing [on|off]   Get or set macOS font smoothing (off = crisper text)")
@@ -636,6 +643,18 @@ case "resolution":
     commandResolution()
 case "restart":
     commandRestart()
+case "boox-resolution":
+    runControlCommand(args.count > 2 ? "BOOX-RESOLUTION \(args[2])" : "BOOX-RESOLUTION")
+case "color":
+    runControlCommand(args.count > 2 ? "COLOR \(args[2])" : "COLOR")
+case "eink":
+    runControlCommand(args.count > 2 ? "EINK \(args[2])" : "EINK")
+case "refresh":
+    runControlCommand("REFRESH")
+case "wireless":
+    runControlCommand(args.count > 2 ? "WIRELESS \(args[2])" : "WIRELESS")
+case "mode":
+    runControlCommand(args.count > 2 ? "DISPLAYMODE \(args[2])" : "DISPLAYMODE")
 case "sharpen":
     commandSharpen()
 case "contrast":

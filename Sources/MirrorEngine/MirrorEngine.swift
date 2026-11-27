@@ -9,6 +9,7 @@
 import Foundation
 import AppKit
 import IOKit
+import IOKit.pwr_mgt
 import Security
 
 public class MirrorEngine: ObservableObject {
@@ -87,6 +88,342 @@ public class MirrorEngine: ObservableObject {
     @Published public var displayMode: DisplayMode {
         didSet { UserDefaults.standard.set(displayMode.rawValue, forKey: "displayMode") }
     }
+    /// Resolution preference for BOOX devices (independent of the DC-1 preference).
+    @Published public var booxResolution: DisplayResolution {
+        didSet { UserDefaults.standard.set(booxResolution.rawValue, forKey: "booxResolution") }
+    }
+    /// Send RGB to BOOX color (Kaleido) panels. Greyscale is 3x less data and lets the
+    /// sharpen/contrast profile shape text exactly like on the DC-1.
+    @Published public var booxColor: Bool {
+        didSet { UserDefaults.standard.set(booxColor, forKey: "booxColor") }
+    }
+    /// BOOX panel waveform preference. Applied live, no restart.
+    @Published public var einkMode: EinkMode = .auto {
+        didSet {
+            UserDefaults.standard.set(Int(einkMode.rawValue), forKey: "einkMode")
+            displayController?.setEinkMode(einkMode)
+        }
+    }
+    /// Whether any active session is a BOOX tablet (drives the menu bar UI).
+    public var hasBoox: Bool { sessions.contains { $0.family == .boox } }
+
+    /// Wireless: also stream to paired devices on the same Wi-Fi (Bonjour + pairing secret,
+    /// see NetworkAccess). Off = USB only; the servers then listen on loopback alone.
+    @Published public var wirelessEnabled: Bool = UserDefaults.standard.bool(forKey: "wirelessEnabled") {
+        didSet {
+            UserDefaults.standard.set(wirelessEnabled, forKey: "wirelessEnabled")
+            guard wirelessEnabled != oldValue else { return }
+            updateRemoteServer()
+            guard status == .running else { return }
+            let wasRemote = startedRemotely
+            stop()
+            Task { @MainActor in
+                await self.waitUntilStopped()
+                self.startedRemotely = wasRemote
+                await self.start()
+            }
+        }
+    }
+
+    /// stop() tears down asynchronously — wait for it before starting again.
+    @MainActor
+    private func waitUntilStopped() async {
+        var waited = 0
+        while (status == .running || status == .stopping) && waited < 100 {
+            try? await Task.sleep(for: .milliseconds(100))
+            waited += 1
+        }
+    }
+
+    // MARK: - Started from the device
+    //
+    // The companion app finds the Mac (USB tunnel or Wi-Fi), asks STATUS, shows a
+    // Mirror / Second monitor chooser and sends START <mode>. See RemoteControlServer.
+
+    private var remoteServer: RemoteControlServer?
+    /// Current session was started from the device: it ends once the device has gone away.
+    private var startedRemotely = false
+    private var launchCompanionOnStart = true
+    private var remoteIdleStop: DispatchWorkItem?
+    /// How long a device-started session survives without the device (app in background,
+    /// tablet asleep, out of Wi-Fi range).
+    static let remoteIdleGrace: TimeInterval = 60
+    private var keepAwakeAssertion: IOPMAssertionID = 0
+    private var userActivityAssertion: IOPMAssertionID = 0
+
+    private func updateRemoteServer() {
+        if remoteServer == nil {
+            remoteServer = RemoteControlServer { [weak self] line in
+                self?.handleRemote(line) ?? "ERR shutting down"
+            }
+        }
+        remoteServer?.start(allowNetwork: wirelessEnabled)
+        holdKeepAwake(wirelessEnabled)
+    }
+
+    /// Wireless: on a power adapter, keep the Mac from idle-sleeping (the screen still
+    /// sleeps) so the device can start mirroring any time. macOS ignores this on battery.
+    private func holdKeepAwake(_ on: Bool) {
+        if on && keepAwakeAssertion == 0 {
+            IOPMAssertionCreateWithName(kIOPMAssertionTypePreventSystemSleep as CFString,
+                                        IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                        "Daylight Mirror: reachable from the tablet over Wi-Fi" as CFString,
+                                        &keepAwakeAssertion)
+        } else if !on && keepAwakeAssertion != 0 {
+            IOPMAssertionRelease(keepAwakeAssertion)
+            keepAwakeAssertion = 0
+        }
+    }
+
+    /// Wake the screens (as if someone touched the Mac) so there is something to capture.
+    private func wakeDisplays() {
+        IOPMAssertionDeclareUserActivity("Daylight Mirror: started from the tablet" as CFString,
+                                         kIOPMUserActiveLocal, &userActivityAssertion)
+    }
+
+    private var statusWord: String {
+        switch status {
+        case .idle, .waitingForDevice: return "idle"
+        case .starting: return "starting"
+        case .running: return "running"
+        case .stopping: return "stopping"
+        case .error: return "error"
+        }
+    }
+
+    @MainActor
+    func handleRemote(_ line: String) -> String {
+        let parts = line.split(separator: " ").map { $0.lowercased() }
+        switch parts.first ?? "" {
+        case "status":
+            return "OK \(statusWord) \(displayMode.rawValue) \(RemoteControlServer.computerName)"
+        case "start":
+            var mode: DisplayMode?
+            if parts.count > 1 {
+                guard let m = DisplayMode(rawValue: parts[1] == "extend" ? "extended" : parts[1]) else {
+                    return "ERR unknown mode (mirror, extend)"
+                }
+                mode = m
+            }
+            return remoteStart(mode: mode)
+        case "release":
+            guard startedRemotely, status == .running else { return "OK kept running" }
+            NSLog("[Remote] Device closed the app — stopping")
+            stop()
+            return "OK stopping"
+        case "stop":
+            guard status == .running else { return "OK already stopped" }
+            NSLog("[Remote] Device asked to stop")
+            stop()
+            return "OK stopping"
+        case "refresh":
+            guard status == .running, hasBoox else { return "ERR not running" }
+            refreshScreen()
+            return "OK refreshed"
+        case "settings":
+            return "OK " + remoteSettings()
+        case "set":
+            guard parts.count >= 3 else { return "ERR usage: SET <mode|resolution|color|eink> <value>" }
+            return remoteSet(parts[1], parts[2])
+        default:
+            return "ERR unknown command"
+        }
+    }
+
+    /// BOOX settings for the device's settings panel, as `key=value` pairs joined by ";".
+    /// presets = raw:Label (size) joined by "|".
+    @MainActor
+    private func remoteSettings() -> String {
+        let presets = DisplayResolution.presets(for: .boox)
+            .map { "\($0.rawValue):\($0.label) (\($0.displaySize))" }
+            .joined(separator: "|")
+        return [
+            "state=\(statusWord)",
+            "mode=\(displayMode == .mirror ? "mirror" : "extended")",
+            "resolution=\(booxResolution.rawValue)",
+            "color=\(booxColor ? 1 : 0)",
+            "eink=\(einkMode.label.lowercased())",
+            "wireless=\(wirelessEnabled ? 1 : 0)",
+            "presets=\(presets)",
+        ].joined(separator: ";")
+    }
+
+    @MainActor
+    private func remoteSet(_ key: String, _ value: String) -> String {
+        switch key {
+        case "mode":
+            guard let m = DisplayMode(rawValue: value == "extend" ? "extended" : value) else { return "ERR unknown mode" }
+            if status == .running || status == .starting { return remoteStart(mode: m) }
+            displayMode = m
+            return "OK \(value)"
+        case "resolution":
+            guard let r = DisplayResolution.presets(for: .boox).first(where: { $0.rawValue == value }) else {
+                return "ERR unknown preset"
+            }
+            applyBooxSettings(resolution: r)
+            return "OK \(value)"
+        case "color":
+            guard value == "on" || value == "off" else { return "ERR use on|off" }
+            applyBooxSettings(color: value == "on")
+            return "OK \(value)"
+        case "eink":
+            guard let m = EinkMode.allCases.first(where: { $0.label.lowercased() == value }) else { return "ERR unknown e-ink mode" }
+            einkMode = m
+            return "OK \(value)"
+        default:
+            return "ERR unknown setting"
+        }
+    }
+
+    /// Restart the running session (new mode / resolution / colour), keeping who started
+    /// it: a device-started session stays device-started (auto-stop, no app relaunch).
+    @MainActor
+    private func restartKeepingOrigin() {
+        let wasRemote = startedRemotely
+        stop()
+        Task { @MainActor in
+            await self.waitUntilStopped()
+            self.startedRemotely = wasRemote
+            await self.start(requestedByDevice: wasRemote)
+        }
+    }
+
+    @MainActor
+    private func remoteStart(mode: DisplayMode?) -> String {
+        let modeChanged = mode != nil && mode != displayMode
+        if let mode { displayMode = mode }
+        wakeDisplays()
+        let modeName = displayMode == .mirror ? "mirror" : "extended"
+        switch status {
+        case .running where !modeChanged:
+            return "OK running \(modeName)"
+        case .starting:
+            if modeChanged {
+                // Still bringing up the previous mode: switch as soon as it's running
+                Task { @MainActor in
+                    while self.status == .starting { try? await Task.sleep(for: .milliseconds(100)) }
+                    if self.status == .running, self.sessions.first?.displayMode != self.displayMode {
+                        self.restartKeepingOrigin()
+                    }
+                }
+            }
+            return "OK starting \(modeName)"
+        case .running, .stopping:
+            NSLog("[Remote] Device asked for %@ — restarting", modeName)
+            if status == .running {
+                restartKeepingOrigin()
+            } else {
+                Task { @MainActor in
+                    await self.waitUntilStopped()
+                    self.startedRemotely = true
+                    await self.start(requestedByDevice: true)
+                }
+            }
+            return "OK starting \(modeName)"
+        case .idle, .waitingForDevice, .error:
+            NSLog("[Remote] Device asked to start (%@)", modeName)
+            status = .idle
+            startedRemotely = true
+            Task { @MainActor in await self.start(requestedByDevice: true) }
+            return "OK starting \(modeName)"
+        }
+    }
+
+    /// Device-started sessions stop once the device has been gone for `remoteIdleGrace`.
+    private func scheduleRemoteIdleCheck() {
+        remoteIdleStop?.cancel()
+        guard startedRemotely else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.startedRemotely, self.status == .running else { return }
+            // Recount from the sessions rather than trusting the cached figure
+            guard self.sessions.reduce(0, { $0 + $1.clientCount }) == 0 else { return }
+            NSLog("[Remote] Device gone for %.0fs — stopping", Self.remoteIdleGrace)
+            self.stop()
+        }
+        remoteIdleStop = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.remoteIdleGrace, execute: work)
+    }
+
+    /// A BOOX was plugged in while idle: get its app open and let it ask which mode to
+    /// use (instead of guessing). Also pairs it for Wi-Fi.
+    private func offerToDevice(_ device: ConnectedDevice) {
+        let serial = device.serial
+        NSLog("[USB] %@ attached — asking on the device which mode to use", device.displayName)
+        rememberDevice(device)
+        if !ADBBridge.isCompanionUpToDate(serial: serial) {
+            NSLog("[USB] Installing companion app v%d", COMPANION_VERSION_CODE)
+            if let error = ADBBridge.installBundledAPK(serial: serial) {
+                NSLog("[USB] APK install error: %@", error)
+            }
+        }
+        _ = ADBBridge.setupReverseTunnel(serial: serial, devicePort: REMOTE_PORT, hostPort: REMOTE_PORT)
+        ADBBridge.launchApp(serial: serial, forceRestart: false,
+                            pairing: (NetworkAccess.secretHex, NetworkAccess.lanAddresses()))
+    }
+
+    /// USB device appeared while idle: a BOOX gets the chooser, anything else auto-starts
+    /// as before.
+    private func usbAttachedWhileIdle() {
+        Task.detached { [weak self] in
+            var devices: [ConnectedDevice] = []
+            for _ in 0..<8 {  // adb needs a moment to enumerate a fresh device
+                devices = ADBBridge.supportedDevices()
+                if !devices.isEmpty { break }
+                try? await Task.sleep(for: .milliseconds(750))
+            }
+            guard let self else { return }
+            if let boox = devices.first(where: { $0.deviceFamily == .boox }) {
+                self.offerToDevice(boox)
+            } else {
+                await MainActor.run {
+                    NSLog("[USB] Device connected — auto-starting mirror")
+                    if self.status == .waitingForDevice { self.status = .idle }
+                    Task { @MainActor in await self.start() }
+                }
+            }
+        }
+    }
+
+    /// The Mac's LAN addresses, for showing in the menu when wireless is on.
+    public var lanAddresses: [String] { NetworkAccess.lanAddresses() }
+
+    /// Last USB-connected device, so a Wi-Fi-only start can set up the right display.
+    private func rememberDevice(_ d: ConnectedDevice) {
+        UserDefaults.standard.set([d.model, d.product, d.deviceName], forKey: "lastDevice")
+    }
+
+    private var lastDevice: ConnectedDevice? {
+        guard let a = UserDefaults.standard.stringArray(forKey: "lastDevice"), a.count == 3 else { return nil }
+        return ConnectedDevice(serial: "none", model: a[0], product: a[1], deviceName: a[2])
+    }
+
+    private func updateBooxPanel(width: UInt, height: UInt) {
+        BooxPanel.update(width: width, height: height)
+        UserDefaults.standard.set([Int(BooxPanel.landscape.w), Int(BooxPanel.landscape.h)], forKey: "booxPanel")
+    }
+    /// Families of supported devices currently on USB (refreshed on plug events) — lets
+    /// the idle menu show the right controls before mirroring starts.
+    @Published public var attachedFamilies: Set<DeviceFamily> = []
+
+    /// Re-read attached devices over adb off the main thread; also re-detects the
+    /// BOOX panel size so preset labels are accurate.
+    public func refreshAttachedDevices() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard ADBBridge.isAvailable() else { return }
+            let devices = ADBBridge.supportedDevices()
+            if let boox = devices.first(where: { $0.deviceFamily == .boox }) {
+                if let size = ADBBridge.displaySize(serial: boox.serial) {
+                    self?.updateBooxPanel(width: size.width, height: size.height)
+                }
+                self?.rememberDevice(boox)
+                // Let the BOOX app reach the Mac over USB (to show its mode chooser) even
+                // when nothing is streaming yet.
+                _ = ADBBridge.setupReverseTunnel(serial: boox.serial, devicePort: REMOTE_PORT, hostPort: REMOTE_PORT)
+            }
+            let families = Set(devices.map { $0.deviceFamily == .other ? .daylightDC1 : $0.deviceFamily })
+            DispatchQueue.main.async { self?.attachedFamilies = families }
+        }
+    }
 
     /// Active device sessions — one per connected Android device.
     /// Published so the menu bar UI can show per-device info.
@@ -143,6 +480,13 @@ public class MirrorEngine: ObservableObject {
         self.resolution = loadedRes
         let savedMode = UserDefaults.standard.string(forKey: "displayMode") ?? ""
         self.displayMode = DisplayMode(rawValue: savedMode) ?? .mirror
+        let savedBoox = UserDefaults.standard.string(forKey: "booxResolution") ?? ""
+        if let p = UserDefaults.standard.array(forKey: "booxPanel") as? [Int], p.count == 2 {
+            BooxPanel.update(width: UInt(max(0, p[0])), height: UInt(max(0, p[1])))
+        }
+        let booxRes = DisplayResolution(rawValue: savedBoox) ?? .booxRetina
+        self.booxResolution = booxRes.family == .boox ? booxRes : .booxRetina
+        self.booxColor = UserDefaults.standard.object(forKey: "booxColor") as? Bool ?? true
         // Migration: v1.7 introduced new defaults (sharpen 1.5, contrast 1.2, gamma 1.2).
         // Old installs have sharpen=1.0, contrast=1.0, gamma=0.0 saved — override those.
         let migrated = UserDefaults.standard.bool(forKey: "v1.7_defaults_migrated")
@@ -170,8 +514,15 @@ public class MirrorEngine: ObservableObject {
         if UserDefaults.standard.object(forKey: "clamshellModeEnabled") != nil {
             self.clamshellModeEnabled = UserDefaults.standard.bool(forKey: "clamshellModeEnabled")
         }
-        NSLog("[MirrorEngine] init, resolution: %@, mode: %@, sharpen: %.1f",
-              resolution.rawValue, displayMode.rawValue, sharpenAmount)
+        if let raw = UserDefaults.standard.object(forKey: "einkMode") as? Int,
+           let mode = EinkMode(rawValue: UInt8(clamping: raw)) {
+            self.einkMode = mode
+        }
+        // A DC-1 preset saved by older builds must not leak into the BOOX slot and vice versa.
+        if resolution.family != .daylightDC1 { resolution = .sharp }
+        NSLog("[MirrorEngine] init, resolution: %@, boox: %@ (%@), mode: %@, sharpen: %.1f",
+              resolution.rawValue, booxResolution.rawValue, booxColor ? "RGB" : "grey",
+              displayMode.rawValue, sharpenAmount)
 
         // Control socket — always listening so CLI can send START/STOP/etc.
         DispatchQueue.main.async { [weak self] in
@@ -179,6 +530,7 @@ public class MirrorEngine: ObservableObject {
             let sock = ControlSocket(engine: self)
             sock.start()
             self.controlSocket = sock
+            self.updateRemoteServer()
         }
 
         // USB device monitoring — auto-detect connect/disconnect
@@ -190,13 +542,10 @@ public class MirrorEngine: ObservableObject {
                 monitor.onDeviceConnected = { [weak self] in
                     guard let self = self else { return }
                     self.deviceDetected = true
-                    if self.autoMirrorEnabled && self.status == .idle {
-                        NSLog("[USB] Device connected — auto-starting mirror")
-                        Task { @MainActor in await self.start() }
-                    } else if self.autoMirrorEnabled && self.status == .waitingForDevice {
-                        NSLog("[USB] Device connected — starting mirror")
-                        self.status = .idle
-                        Task { @MainActor in await self.start() }
+                    // adb needs a moment to enumerate a freshly plugged device
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.refreshAttachedDevices() }
+                    if self.autoMirrorEnabled && (self.status == .idle || self.status == .waitingForDevice) {
+                        self.usbAttachedWhileIdle()
                     } else if self.autoMirrorEnabled && self.status == .stopping {
                         NSLog("[USB] Device connected while stopping — will restart after teardown")
                         Task { @MainActor in
@@ -204,8 +553,8 @@ public class MirrorEngine: ObservableObject {
                                 try? await Task.sleep(for: .milliseconds(200))
                             }
                             if self.status == .idle {
-                                NSLog("[USB] Teardown complete — restarting mirror")
-                                await self.start()
+                                NSLog("[USB] Teardown complete")
+                                self.usbAttachedWhileIdle()
                             }
                         }
                     } else if self.status == .running {
@@ -216,7 +565,9 @@ public class MirrorEngine: ObservableObject {
                 monitor.onDeviceDisconnected = { [weak self] in
                     guard let self = self else { return }
                     self.deviceDetected = false
-                    if self.autoMirrorEnabled && self.status == .running {
+                    self.refreshAttachedDevices()
+                    // Wireless: keep streaming — the device falls back to Wi-Fi on its own
+                    if self.autoMirrorEnabled && self.status == .running && !self.wirelessEnabled {
                         NSLog("[USB] Device disconnected — stopping mirror")
                         self.stop()
                         self.status = .waitingForDevice
@@ -225,6 +576,7 @@ public class MirrorEngine: ObservableObject {
                 monitor.start()
                 self.usbMonitor = monitor
                 self.deviceDetected = monitor.isDeviceConnected
+                self.refreshAttachedDevices()
             }
         }
 
@@ -301,8 +653,11 @@ public class MirrorEngine: ObservableObject {
     // MARK: - Start / Stop
 
     @MainActor
-    public func start() async {
+    /// `requestedByDevice`: the device's chooser asked for this — its app is already open,
+    /// and the session ends once the device goes away.
+    public func start(requestedByDevice: Bool = false) async {
         guard status == .idle || status != .starting else { return }
+        launchCompanionOnStart = !requestedByDevice
 
         if fontSmoothingDisabled { setFontSmoothing(enabled: false) }
 
@@ -333,28 +688,52 @@ public class MirrorEngine: ObservableObject {
             ADBBridge.ensureServerRunning()
         }
 
-        let devices = ADBBridge.isAvailable() ? ADBBridge.connectedDevices() : []
+        // Only DC-1 / BOOX get sessions — phones and emulators on adb are ignored.
+        let devices = ADBBridge.isAvailable() ? ADBBridge.supportedDevices() : []
         if devices.isEmpty {
-            NSLog("[Engine] No devices found — creating default session (DC-1 resolution)")
-            let pseudoDevice = ConnectedDevice(serial: "none", model: "unknown")
-            let session = DeviceSession(
-                port: TCP_PORT, resolution: resolution,
-                displayMode: displayMode, device: pseudoDevice
-            )
-            await startSession(session, wsServer: wsServer)
+            // Wireless: set up the display for the last device seen over USB, then wait
+            // for it to connect over Wi-Fi.
+            if wirelessEnabled, let last = lastDevice {
+                NSLog("[Engine] No USB device — waiting for %@ over Wi-Fi", last.displayName)
+                let session = DeviceSession(
+                    port: TCP_PORT, resolution: resolutionForDevice(last),
+                    displayMode: displayMode, device: last,
+                    useColor: last.deviceFamily == .boox && booxColor, wireless: true
+                )
+                await startSession(session, wsServer: wsServer)
+            } else {
+                NSLog("[Engine] No devices found — creating default session (DC-1 resolution)")
+                let pseudoDevice = ConnectedDevice(serial: "none", model: "unknown")
+                let session = DeviceSession(
+                    port: TCP_PORT, resolution: resolution,
+                    displayMode: displayMode, device: pseudoDevice, wireless: wirelessEnabled
+                )
+                await startSession(session, wsServer: wsServer)
+            }
         } else {
             // Sort: DC-1 first (gets primary port 8888), then other devices.
             // This ensures stable port assignment regardless of USB enumeration order.
-            let sorted = devices.sorted { a, _ in a.deviceFamily == .daylightDC1 }
+            let sorted = devices.sorted { a, b in
+                a.deviceFamily == .daylightDC1 && b.deviceFamily != .daylightDC1
+            }
+            // Size BOOX presets to the panel's real drawable area before creating displays
+            if let boox = sorted.first(where: { $0.deviceFamily == .boox }),
+               let size = ADBBridge.displaySize(serial: boox.serial) {
+                updateBooxPanel(width: size.width, height: size.height)
+                NSLog("[Engine] BOOX panel: %dx%d drawable", BooxPanel.landscape.w, BooxPanel.landscape.h)
+            }
             var port = TCP_PORT
             for (_, device) in sorted.enumerated() {
                 let res = resolutionForDevice(device)
                 // Primary device uses user's display mode preference.
                 // Additional devices always get their own extended display.
                 let mode: DisplayMode = (port == TCP_PORT) ? displayMode : .extended
+                if port == TCP_PORT { rememberDevice(device) }
                 let session = DeviceSession(
                     port: port, resolution: res,
-                    displayMode: mode, device: device
+                    displayMode: mode, device: device,
+                    useColor: device.deviceFamily == .boox && booxColor,
+                    wireless: wirelessEnabled && port == TCP_PORT
                 )
                 // Primary session (port 8888) gets the WS server for browser preview
                 let ws: WebSocketServer? = (port == TCP_PORT) ? wsServer : nil
@@ -367,11 +746,14 @@ public class MirrorEngine: ObservableObject {
             }
         }
 
-        // Display controller — attach to DC-1 session's TCP server for brightness/warmth
-        if let dc1Session = sessions.first(where: { $0.device.deviceFamily == .daylightDC1 }),
-           let tcp = dc1Session.tcpServer {
-            let serial = dc1Session.device.serial != "none" ? dc1Session.device.serial : nil
-            let dc = DisplayController(tcpServer: tcp, deviceSerial: serial)
+        // Display controller — attach to the primary panel's TCP server for
+        // brightness/warmth (DC-1 first, otherwise a BOOX).
+        if let panel = sessions.first(where: { $0.family == .daylightDC1 }) ?? sessions.first(where: { $0.family == .boox }),
+           let tcp = panel.tcpServer {
+            // Wi-Fi-only session: "none" makes adb calls fail instead of reaching some other
+            // attached device (e.g. a phone on wireless debugging).
+            let serial = panel.device.serial != "none" ? panel.device.serial : (panel.wireless ? "none" : nil)
+            let dc = DisplayController(tcpServer: tcp, deviceSerial: serial, family: panel.family)
             dc.onBrightnessChanged = { [weak self] val in
                 DispatchQueue.main.async { self?.brightness = val }
             }
@@ -382,6 +764,7 @@ public class MirrorEngine: ObservableObject {
                 DispatchQueue.main.async { self?.backlightOn = on }
             }
             dc.start()
+            dc.setEinkMode(einkMode)
             displayController = dc
             brightness = dc.currentBrightness
             warmth = dc.currentWarmth
@@ -393,6 +776,10 @@ public class MirrorEngine: ObservableObject {
         status = .running
 
         if clamshellModeEnabled { createSleepAssertion() }
+        // A device can connect before its session is in `sessions` (the tunnel is already
+        // up, so it connects the moment the server listens) — recount now that it is.
+        aggregateClientCount()
+        if startedRemotely && clientCount == 0 { scheduleRemoteIdleCheck() }
 
         let sessionSummary = sessions.map { "\($0.device.model)@\($0.port):\($0.resolution.rawValue)" }
         print("---")
@@ -403,6 +790,7 @@ public class MirrorEngine: ObservableObject {
     /// Start a single DeviceSession and wire up its stats callbacks.
     @MainActor
     private func startSession(_ session: DeviceSession, wsServer: WebSocketServer?) async {
+        session.relaunchCompanion = launchCompanionOnStart
         // Wire stats back to engine's @Published properties (aggregated across sessions)
         session.onStatsChanged = { [weak self] in
             DispatchQueue.main.async { self?.aggregateStats() }
@@ -435,7 +823,7 @@ public class MirrorEngine: ObservableObject {
     /// Resolution for a given device. Currently all devices use the same resolution.
     /// Future: auto-detect panel size and generate appropriate presets.
     private func resolutionForDevice(_ device: ConnectedDevice) -> DisplayResolution {
-        return resolution
+        device.deviceFamily == .boox ? booxResolution : resolution
     }
 
     /// Aggregate stats from all sessions for the UI.
@@ -457,10 +845,14 @@ public class MirrorEngine: ObservableObject {
         let total = sessions.reduce(0) { $0 + $1.clientCount }
         let wasConnected = clientCount > 0
         clientCount = total
+        if startedRemotely {
+            if total == 0 { scheduleRemoteIdleCheck() } else { remoteIdleStop?.cancel() }
+        }
 
-        // Auto-dim Mac when any client connects
+        // Auto-dim Mac when any client connects — mirror mode only: as a second monitor
+        // the Mac screen is still in use. Restoring still runs if we dimmed earlier.
         if autoDimMac {
-            if total > 0 && !wasConnected {
+            if total > 0 && !wasConnected && displayMode == .mirror {
                 if let current = MacBrightness.get() {
                     savedMacBrightness = current
                     MacBrightness.set(0)
@@ -482,6 +874,8 @@ public class MirrorEngine: ObservableObject {
         guard status == .running || status == .waitingForDevice else { return }
         if status == .waitingForDevice { status = .idle; return }
         DispatchQueue.main.async { self.status = .stopping }
+        startedRemotely = false
+        remoteIdleStop?.cancel()
 
         releaseSleepAssertion()
 
@@ -527,24 +921,43 @@ public class MirrorEngine: ObservableObject {
     public func reconnect() {
         guard status == .running else { return }
         print("[MirrorEngine] Reconnecting ADB...")
+        let wireless = wirelessEnabled
         Task.detached {
+            // adb needs a moment to enumerate a freshly plugged device
+            var usb: [ConnectedDevice] = []
+            for _ in 0..<8 {
+                usb = ADBBridge.supportedDevices()
+                if !usb.isEmpty { break }
+                try? await Task.sleep(for: .milliseconds(750))
+            }
             for session in self.sessions {
-                guard !session.adbConnected else { continue }
+                // A Wi-Fi session may have no serial (started without USB) or a stale
+                // tunnel from before the unplug — always re-tunnel when wireless.
+                var serial = session.device.serial
+                if serial == "none" {
+                    guard let d = usb.first(where: { $0.deviceFamily == session.family }) else { continue }
+                    serial = d.serial
+                }
+                guard usb.contains(where: { $0.serial == serial }) else { continue }
+                if session.adbConnected && !wireless { continue }
                 let tunnelOK = ADBBridge.setupReverseTunnel(
-                    serial: session.device.serial,
+                    serial: serial,
                     devicePort: TCP_PORT,
                     hostPort: session.port
                 )
                 if tunnelOK {
                     // Input tunnel — non-blocking; touch disabled if this fails
                     let inputOK = ADBBridge.setupReverseTunnel(
-                        serial: session.device.serial,
+                        serial: serial,
                         devicePort: INPUT_PORT,
                         hostPort: INPUT_PORT
                     )
-                    if !inputOK { NSLog("[ADB] Input tunnel failed for %@ — touch disabled", session.device.serial) }
-                    ADBBridge.launchApp(serial: session.device.serial)
-                    NSLog("[ADB] Reconnected %@", session.device.serial)
+                    if !inputOK { NSLog("[ADB] Input tunnel failed for %@ — touch disabled", serial) }
+                    _ = ADBBridge.setupReverseTunnel(serial: serial, devicePort: REMOTE_PORT, hostPort: REMOTE_PORT)
+                    // Refresh pairing; the app notices the tunnel and moves off Wi-Fi itself
+                    ADBBridge.launchApp(serial: serial, forceRestart: false,
+                                        pairing: (NetworkAccess.secretHex, NetworkAccess.lanAddresses()))
+                    NSLog("[ADB] Reconnected %@ over USB", serial)
                 }
             }
             await MainActor.run {
@@ -571,6 +984,21 @@ public class MirrorEngine: ObservableObject {
     public func setWarmth(_ value: Int) {
         displayController?.setWarmth(value)
         warmth = max(0, min(255, value))
+    }
+
+    /// Full e-ink refresh on the BOOX panel (clears ghosting). Ctrl+F5.
+    public func refreshScreen() {
+        displayController?.refreshScreen()
+    }
+
+    /// Change the BOOX preset or pixel format. Needs a new virtual display and capture
+    /// buffers, so a running mirror is restarted.
+    public func applyBooxSettings(resolution newRes: DisplayResolution? = nil, color: Bool? = nil) {
+        var changed = false
+        if let r = newRes, r.family == .boox, r != booxResolution { booxResolution = r; changed = true }
+        if let c = color, c != booxColor { booxColor = c; changed = true }
+        guard changed, status == .running, hasBoox else { return }
+        Task { @MainActor in self.restartKeepingOrigin() }
     }
 
     public func toggleBacklight() {

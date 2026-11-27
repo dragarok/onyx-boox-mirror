@@ -58,9 +58,13 @@ public class InputServer {
 
     public private(set) var running = false
 
-    public init(port: UInt16, targetDisplayID: CGDirectDisplayID) throws {
+    /// Wireless: also accept paired clients from the LAN (see NetworkAccess).
+    let allowNetwork: Bool
+
+    public init(port: UInt16, targetDisplayID: CGDirectDisplayID, allowNetwork: Bool = false) throws {
         self.port = port
         self.targetDisplayID = targetDisplayID
+        self.allowNetwork = allowNetwork
     }
 
     public func start() {
@@ -69,14 +73,17 @@ public class InputServer {
         // Check accessibility permission (required for CGEvent injection)
         if !AXIsProcessTrusted() {
             if !accessibilityWarned {
-                NSLog("[Input] WARNING: Accessibility permission not granted — touch injection will fail. Grant in System Settings > Privacy > Accessibility.")
+                NSLog("[Input] WARNING: Accessibility permission not granted — touch and keyboard injection will fail. Grant in System Settings > Privacy > Accessibility.")
                 accessibilityWarned = true
+                // Without this, clicks and keys are dropped silently. Ask macOS to show its
+                // prompt (lists the app in Settings with a toggle) — once per launch.
+                let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+                AXIsProcessTrustedWithOptions(options)
             }
         }
 
         do {
-            let params = NWParameters.tcp
-            params.allowLocalEndpointReuse = true
+            let params = NetworkAccess.listenerParameters(allowNetwork: allowNetwork)
             listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
         } catch {
             NSLog("[Input] Failed to create listener on port %d: %@", port, "\(error)")
@@ -119,8 +126,14 @@ public class InputServer {
     // MARK: - Connection Handling
 
     private func handleConnection(_ connection: NWConnection) {
+        let viaNetwork = !NetworkAccess.isLoopback(connection.endpoint)
+        // Input injection = control of this Mac: LAN clients must be paired
+        if viaNetwork && !allowNetwork {
+            connection.cancel()
+            return
+        }
         connections.append(connection)
-        NSLog("[Input] Client connected")
+        NSLog("[Input] Client connected%@", viaNetwork ? " (Wi-Fi, verifying pairing)" : "")
 
         connection.stateUpdateHandler = { [weak self] state in
             if case .failed = state { self?.removeConnection(connection) }
@@ -128,10 +141,23 @@ public class InputServer {
         }
 
         connection.start(queue: queue)
-        receivePackets(from: connection)
+        if viaNetwork {
+            NetworkAccess.authenticate(connection, queue: queue) { [weak self] ok in
+                guard let self else { return }
+                if ok {
+                    self.receivePackets(from: connection)
+                } else {
+                    NSLog("[Input] Rejected unpaired client %@", "\(connection.endpoint)")
+                    self.removeConnection(connection)
+                }
+            }
+        } else {
+            receivePackets(from: connection)
+        }
     }
 
     private func removeConnection(_ connection: NWConnection) {
+        partial[ObjectIdentifier(connection)] = nil
         connections.removeAll { $0 === connection }
         connection.cancel()
         // Reset mouse state when client disconnects
@@ -147,13 +173,21 @@ public class InputServer {
         scrollEndTimer = nil
     }
 
-    /// Continuously receive and parse 23-byte touch packets from the connection.
+    /// Bytes left over from a read that ended mid-packet, per connection.
+    private var partial: [ObjectIdentifier: Data] = [:]
+
+    /// Continuously receive and parse 23-byte input packets from the connection.
     private func receivePackets(from connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: INPUT_PACKET_SIZE, maximumLength: INPUT_PACKET_SIZE * 16) { [weak self] content, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: INPUT_PACKET_SIZE * 16) { [weak self] content, _, isComplete, error in
             guard let self else { return }
 
             if let data = content, !data.isEmpty {
-                self.parsePackets(data)
+                let key = ObjectIdentifier(connection)
+                var buffer = (self.partial[key] ?? Data()) + data
+                let usable = buffer.count - buffer.count % INPUT_PACKET_SIZE
+                if usable > 0 { self.parsePackets(buffer.prefix(usable)) }
+                buffer = buffer.suffix(from: buffer.startIndex + usable)
+                self.partial[key] = buffer.isEmpty ? nil : Data(buffer)
             }
 
             if isComplete || error != nil {
@@ -170,6 +204,7 @@ public class InputServer {
 
     /// Parse one or more 23-byte packets from a data buffer.
     private func parsePackets(_ data: Data) {
+        let data = Data(data)  // zero-based indices
         var offset = 0
         while offset + INPUT_PACKET_SIZE <= data.count {
             let packet = data[offset..<(offset + INPUT_PACKET_SIZE)]
@@ -182,6 +217,14 @@ public class InputServer {
             }
 
             let type = packet[packet.startIndex + 2]
+            if type == INPUT_KEY {
+                KeyInjector.inject(androidKeycode: Int(readUInt32(packet, offset: 3)),
+                                   scanCode: Int(readUInt32(packet, offset: 19)),
+                                   down: readUInt32(packet, offset: 7) == 0,
+                                   metaState: Int(readUInt32(packet, offset: 11)),
+                                   repeatCount: Int(readUInt32(packet, offset: 15)))
+                continue
+            }
             let x = readFloat(packet, offset: 3)
             let y = readFloat(packet, offset: 7)
             let dx = readFloat(packet, offset: 11)
@@ -190,6 +233,13 @@ public class InputServer {
 
             handleTouchEvent(type: type, x: x, y: y, dx: dx, dy: dy)
         }
+    }
+
+    /// Read a little-endian UInt32 from a Data slice at the given byte offset.
+    private func readUInt32(_ data: Data, offset: Int) -> UInt32 {
+        let start = data.startIndex + offset
+        return UInt32(data[start]) | UInt32(data[start + 1]) << 8
+            | UInt32(data[start + 2]) << 16 | UInt32(data[start + 3]) << 24
     }
 
     /// Read a little-endian IEEE 754 float from a Data slice at the given byte offset.
